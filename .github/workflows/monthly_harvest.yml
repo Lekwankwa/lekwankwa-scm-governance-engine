@@ -1,0 +1,33 @@
+# monthly_harvest.yml — GitHub Actions automation pipeline (PLACEHOLDER)
+#
+# Intended to run core/harvester.py (not yet implemented — see that file's
+# TODO) on a monthly schedule, appending the newest Stats SA CPI figure to
+# data/stats_sa_cpi_archive.csv and committing the result.
+#
+# Disabled for now (workflow_dispatch only) until core/harvester.py exists,
+# so nothing runs unexpectedly on push/schedule.
+
+name: Monthly Stats SA CPI Harvest
+
+on:
+  workflow_dispatch: {}
+  # schedule:
+  #   - cron: "0 6 1 * *"   # 06:00 UTC on the 1st of every month — enable once harvester.py is built
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run harvester (placeholder — not yet implemented)
+        run: |
+          echo "TODO: core/harvester.py does not exist yet."
+          echo "python core/harvester.py --append"
