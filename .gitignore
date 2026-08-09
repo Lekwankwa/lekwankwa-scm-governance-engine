@@ -3,4 +3,5 @@ __pycache__/
 .venv/
 venv/
 data/scm_run_changelog.jsonl
+data/tenders.json
 *.log

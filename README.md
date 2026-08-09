@@ -30,11 +30,13 @@ Lekwankwa SCM Governance Engine/
 │
 ├── data/
 │   ├── stats_sa_cpi_archive.csv     # 2-Year historical Point-in-Time CSV vault (real Stats SA data, 2024-07..2026-06)
+│   ├── tenders.json                 # Tender registry — generated at runtime, one entry per anchored tender
 │   └── README.md                    # Provenance: exact source URL, series code, ingestion date
 │
 ├── core/
 │   ├── __init__.py
 │   ├── harvester.py                 # Stats SA CPI web harvester — ingests the official time series
+│   ├── tender_registry.py           # JSON persistence for anchored tenders (Product 1 -> Product 2/3 handoff)
 │   └── validator.py                 # The 10-Stage Data Integrity Engine
 │
 ├── utils/
@@ -48,7 +50,7 @@ Lekwankwa SCM Governance Engine/
 
 ## 🗄️ 2. Unified Database Layout (The CSV/JSON Schema)
 
-To ensure zero code clashing across all three products, every contract row logged via the frontend is written to an internal database ledger using this exact schema layout:
+To ensure zero code clashing across all three products, every contract row logged via the frontend is written to an internal database ledger using this exact schema layout. `core/tender_registry.py` persists the anchor-time subset of this schema (`tender_id`, `tender_name`, `base_value`, `start_date`, `end_date`, `baseline_type`, `anchor_month`, `anchor_cpi_value`) to `data/tenders.json` — the row-level fields (`current_vintage_*`, `calculated_drift_pct`, `audit_integrity_hash`) are computed fresh per check instead of stored, by `core/validator.py`'s `run_monthly_check()`.
 
 | Data Column Header | Primitive Type | System Purpose | Validation State |
 |---|---|---|---|
@@ -103,3 +105,12 @@ streamlit run app.py
 ```
 
 `data/stats_sa_cpi_archive.csv` is ingested directly from Stats SA's own published time series (see `data/README.md` for the exact source URL, series code, and ingestion date) — not placeholder data. Re-run `core/harvester.py` at any time to pull the latest month once Stats SA publishes it.
+
+## 📋 6. Tender Registry Workflow
+
+The sidebar's "Mode" selector splits the app into the two moments a real SCM audit actually has:
+
+- **Anchor New Tender** (Product 1, Inception Gateway) — enter tender metadata once, pick the execution/start date. Clicking **Anchor Tender** runs that single month through the full 10-stage gate, locks its CPI as the tender's permanent anchor, and writes the whole record to `data/tenders.json` via `core/tender_registry.py`. Re-anchoring an existing `tender_id` is refused — use the other mode to check it instead.
+- **Open Existing Tender** (Product 2/3, recurring audits) — pick a previously anchored tender from the registry (no metadata re-entry) and a check month from the CPI archive. Monthly-baseline tenders can pick any month on/after the anchor; annual-baseline tenders only see the 12-month anniversary dates. **Run Monthly Check** compares that month's CPI against the *locked* anchor value (not a freshly recomputed one — see `SCMDataValidator.run_monthly_check()`), still gated by the full 10-stage pipeline across the anchor-to-check-month span.
+
+Both modes render through the same result panel and produce the same certified PDF/JSON export pair, keyed to whichever run (anchor or check) most recently succeeded.

@@ -292,8 +292,20 @@ class SCMDataValidator:
         return results, True, extras
 
     # ── Timeline processing (drift math) ────────────────────────────────────
-    def process_timeline_loop(self, start_date_str, end_date_str, tender_id="N/A"):
-        """Executes the monthly progression loop, gated by the 10-stage pipeline."""
+    def process_timeline_loop(self, start_date_str, end_date_str, tender_id="N/A", baseline_type=None):
+        """Executes the monthly progression loop, gated by the 10-stage pipeline.
+
+        baseline_type selects which rows get RETURNED (the 10-stage gate and
+        the drift math always run over the full requested range regardless):
+          "Total Annual Contract Allocation Value" -> Product 3, Annual
+              Anniversary Engine. Only Month 1 and every 12-month anniversary
+              (index 0, 12, 24, ...) are returned -- relies on Stage 1c having
+              already guaranteed no gaps, so list position == months-since-start.
+          anything else (including the default None, used by the __main__
+              smoke test below) -> Product 2, Monthly Invoice Auditor. The
+              full month-by-month list is returned, same as before this
+              parameter existed.
+        """
         start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
         start_lookup = start_dt.strftime("%Y-%m")
@@ -332,7 +344,64 @@ class SCMDataValidator:
                 "drift_percentage": round(drift_pct, 4),
             })
 
-        return processed_records, stage_results, extras, output_hash
+        if baseline_type == "Total Annual Contract Allocation Value":
+            # Product 3: Month 1 anchor plus every strict 12-month anniversary.
+            display_records = [r for i, r in enumerate(processed_records) if i == 0 or i % 12 == 0]
+        else:
+            # Product 2 (default): every gated month, unfiltered.
+            display_records = processed_records
+
+        return display_records, stage_results, extras, output_hash
+
+    # ── Recurring check against a locked (registry) anchor ──────────────────
+    def run_monthly_check(self, anchor_month, anchor_cpi_value, check_month, tender_id="N/A"):
+        """Product 2/3 recurring check: one specific month, checked against a
+        previously LOCKED anchor (from core/tender_registry.py) rather than
+        recomputing the anchor from the live archive. This is what "no
+        metadata re-entry required" means -- the anchor is fixed at whatever
+        it was when the tender was first anchored, even if the archive is
+        later refreshed by core/harvester.py.
+
+        Still runs the full 10-stage gate across anchor_month..check_month,
+        so a data gap or integrity problem introduced since anchoring still
+        blocks the check -- only the anchor VALUE itself is exempt from
+        recomputation.
+
+        Returns a single-row list in the same shape as process_timeline_loop(),
+        so app.py / document_gen.py can render either one with no branching.
+        """
+        if check_month < anchor_month:
+            raise ValueError(
+                f"Check month {check_month} is before the tender's anchor month {anchor_month}."
+            )
+
+        run_signature = f"{tender_id}|{anchor_month}|{check_month}|locked-check"
+        output_hash = hashlib.sha256(run_signature.encode("utf-8")).hexdigest()[:16]
+
+        stage_results, pipeline_ok, extras = self.run_10_stage_pipeline(
+            anchor_month, check_month, tender_id=tender_id, output_hash=output_hash
+        )
+        if not pipeline_ok:
+            failed = next((r for r in stage_results if r["status"] == "FAIL"), None)
+            raise ValueError(
+                f"10-Stage pipeline halted at Stage {failed['stage']} ({failed['name']}): {failed['detail']}"
+                if failed else "10-Stage pipeline failed."
+            )
+
+        check_row = self.archive_df[self.archive_df["Date"] == check_month]
+        if check_row.empty:
+            raise ValueError(f"Check month {check_month} does not resolve to an archive row.")
+        current_cpi = float(check_row["CPI_Value"].values[0])
+
+        anchor_cpi_value = float(anchor_cpi_value)
+        drift_pct = ((current_cpi / anchor_cpi_value) - 1) * 100
+        record = {
+            "month": check_month,
+            "anchor_cpi": anchor_cpi_value,
+            "current_cpi": current_cpi,
+            "drift_percentage": round(drift_pct, 4),
+        }
+        return [record], stage_results, extras, output_hash
 
 
 if __name__ == "__main__":
