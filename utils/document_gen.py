@@ -119,9 +119,11 @@ def build_audit_pdf(
     Record", or "Annual Contract Price Adjustment Record".
 
     escalation_info, when set, is a dict with effective_date, old_base_zar,
-    new_base_zar: a formal Annual Escalation actually changes the contract's
-    baseline value, so that gets its own explicit notice section up front
-    rather than being buried in the metadata table.
+    new_base_zar, and (once approved) approved_by/approved_at: a formal
+    Annual Escalation actually changes the contract's baseline value, so
+    that gets its own explicit notice section up front rather than being
+    buried in the metadata table -- and per the approval-gated workflow,
+    every applied escalation must show who approved it and when.
     """
     lineage = lineage or {}
     outliers = outliers or []
@@ -137,15 +139,45 @@ def build_audit_pdf(
         pdf.set_fill_color(255, 245, 225)
         pdf.set_font("Helvetica", "B", 10.5)
         pdf.set_text_color(0, 0, 0)
+        approval_line = ""
+        if escalation_info.get("approved_by"):
+            approval_line = (f" Approved by {escalation_info['approved_by']} "
+                              f"on {escalation_info.get('approved_at', 'N/A')}.")
         notice = (
             "This is a formal annual price adjustment. Effective "
             f"{escalation_info['effective_date']}, the contract's baseline value "
             f"is revised from R{escalation_info['old_base_zar']:,.2f} to "
-            f"R{escalation_info['new_base_zar']:,.2f}."
+            f"R{escalation_info['new_base_zar']:,.2f}.{approval_line}"
         )
         pdf.multi_cell(0, 7, _safe(notice), border=1, fill=True,
                         new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(4)
+
+        # Full derivation chain, per the CPA formula requirement: the
+        # original tender baseline stays visible and unchanged, the prior
+        # year's adjusted price shows for a compounding tender, and the
+        # formula used is explicit, so an auditor can trace the whole chain
+        # from the original tender to the current price in this one document.
+        is_compound = escalation_info.get("formula_type") == "COMPOUND_FROM_PRIOR_YEAR"
+        derivation_rows = [
+            ("Formula Type Used", escalation_info.get("formula_type", "N/A")),
+            ("Original Baseline (permanent)",
+             f"{escalation_info.get('original_anchor_month', 'N/A')} -- "
+             f"CPI {escalation_info.get('original_anchor_cpi', 'N/A')}, "
+             f"Base R{escalation_info.get('original_base_zar', 0):,.2f}"),
+        ]
+        if is_compound:
+            derivation_rows.append((
+                "Prior Year Adjusted Price",
+                f"{escalation_info.get('prior_anchor_month', 'N/A')} -- "
+                f"R{escalation_info.get('prior_adjusted_price', 0):,.2f}",
+            ))
+        derivation_rows.append((
+            "This Year's New Adjusted Price",
+            f"{escalation_info['effective_date']} -- R{escalation_info['new_base_zar']:,.2f}",
+        ))
+        _kv_table(pdf, derivation_rows, label_width=65)
+        pdf.ln(2)
 
     # ── Tender metadata ──────────────────────────────────────────────────
     _section_title(pdf, "1. Tender Metadata")

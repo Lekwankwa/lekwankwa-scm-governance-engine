@@ -69,12 +69,39 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
     latest_data = timeline_results[-1]
 
     if escalation_info:
+        approval_line = ""
+        if escalation_info.get("approved_by"):
+            approval_line = (f" Approved by {escalation_info['approved_by']} "
+                              f"on {escalation_info.get('approved_at', 'N/A')}.")
         st.warning(
             "This is a formal annual price adjustment. Effective "
             f"{escalation_info['effective_date']}, the contract's baseline value "
             f"is revised from R{escalation_info['old_base_zar']:,.2f} to "
-            f"R{escalation_info['new_base_zar']:,.2f}."
+            f"R{escalation_info['new_base_zar']:,.2f}.{approval_line}"
         )
+
+        # Full derivation chain, per the CPA formula requirement: the
+        # original tender baseline stays visible and unchanged, the prior
+        # year's adjusted price shows for a compounding tender, and the
+        # formula used is explicit -- so the whole chain from original
+        # tender to current price is auditable in one document.
+        is_compound = escalation_info.get("formula_type") == "COMPOUND_FROM_PRIOR_YEAR"
+        derivation_lines = [
+            f"Formula Type Used: {escalation_info.get('formula_type', 'N/A')}",
+            f"Original Baseline (permanent, {escalation_info.get('original_anchor_month', 'N/A')}): "
+            f"CPI {escalation_info.get('original_anchor_cpi', 'N/A')}, "
+            f"Base R{escalation_info.get('original_base_zar', 0):,.2f}",
+        ]
+        if is_compound:
+            derivation_lines.append(
+                f"Prior Year Adjusted Price ({escalation_info.get('prior_anchor_month', 'N/A')}): "
+                f"R{escalation_info.get('prior_adjusted_price', 0):,.2f}"
+            )
+        derivation_lines.append(
+            f"This Year's New Adjusted Price ({escalation_info['effective_date']}): "
+            f"R{escalation_info['new_base_zar']:,.2f}"
+        )
+        st.info("\n\n".join(derivation_lines))
 
     # METRIC DISPLAY MATRIX (Top Layer Visualization)
     col1, col2, col3 = st.columns(3)
@@ -177,7 +204,7 @@ with st.sidebar:
 
     trigger_anchor = False
     trigger_check = False
-    trigger_escalation = False
+    trigger_calculate_escalation = False
     selected_tender = None
     check_month = None
     check_month_is_anniversary = False
@@ -193,6 +220,22 @@ with st.sidebar:
             "Contract Structure Baseline Type",
             ["Monthly Base Recurring Invoice Value", "Total Annual Contract Allocation Value"],
         )
+
+        # Only meaningful for Annual-baseline tenders (it governs how Annual
+        # Escalation derives each year's adjusted price -- see the Calculate
+        # Annual Escalation branch below); fixed for Monthly tenders since
+        # they never go through that flow.
+        if baseline_type == "Total Annual Contract Allocation Value":
+            cpa_formula_type = st.radio(
+                "Annual CPA Formula Type (set once, permanent for this tender)",
+                ["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"],
+                format_func=lambda x: {
+                    "CUMULATIVE_FROM_ORIGINAL": "Cumulative from Original Anchor",
+                    "COMPOUND_FROM_PRIOR_YEAR": "Compound from Prior Year",
+                }[x],
+            )
+        else:
+            cpa_formula_type = "CUMULATIVE_FROM_ORIGINAL"
 
         base_value = st.number_input("Base Contract Valuation (ZAR)", min_value=1.0, value=1000000.0, step=1000.0)
 
@@ -213,16 +256,23 @@ with st.sidebar:
             selected_tender = get_tender(options[picked_label])
 
             st.caption(f"Baseline: {selected_tender['baseline_type']}")
-            st.caption(f"Anchor: {selected_tender['anchor_month']} @ CPI {selected_tender['anchor_cpi_value']}")
-            st.caption(f"Base Value (ZAR): {selected_tender['base_value']:,.2f}")
+            if selected_tender["baseline_type"] == "Total Annual Contract Allocation Value":
+                st.caption(f"CPA Formula: {selected_tender.get('cpa_formula_type', 'CUMULATIVE_FROM_ORIGINAL')}")
+            st.caption(f"Original Anchor (permanent): {selected_tender['original_anchor_month']} "
+                        f"@ CPI {selected_tender['original_anchor_cpi']} "
+                        f"(base R{selected_tender['original_base_value']:,.2f})")
+            st.caption(f"Current: {selected_tender['current_anchor_month']} "
+                        f"@ CPI {selected_tender['current_anchor_cpi']} "
+                        f"(adjusted price R{selected_tender['current_adjusted_price']:,.2f})")
 
-            # Every month on/after the anchor is selectable for BOTH baseline
-            # types -- an annual tender isn't limited to its anniversary date,
-            # that's just the one that gets highlighted/defaulted to, and the
-            # only one "Run Annual Escalation" is offered for (see below).
+            # Every month on/after the CURRENT anchor is selectable for BOTH
+            # baseline types -- an annual tender isn't limited to its
+            # anniversary date, that's just the one that gets
+            # highlighted/defaulted to, and the only one "Calculate Annual
+            # Escalation" is offered for (see below).
             archive_dates = pd.read_csv(ARCHIVE_PATH)["Date"].astype(str).tolist()
-            eligible_months = [d for d in archive_dates if d >= selected_tender["anchor_month"]]
-            anniversary_months = set(_anniversary_months(selected_tender["anchor_month"], eligible_months))
+            eligible_months = [d for d in archive_dates if d >= selected_tender["current_anchor_month"]]
+            anniversary_months = set(_anniversary_months(selected_tender["current_anchor_month"], eligible_months))
             is_annual = selected_tender["baseline_type"] == "Total Annual Contract Allocation Value"
 
             if not eligible_months:
@@ -235,14 +285,14 @@ with st.sidebar:
 
                 check_month = st.selectbox(
                     "Select Check Month", eligible_months, index=default_index,
-                    format_func=lambda m: _month_label(m, selected_tender["anchor_month"], anniversary_months),
+                    format_func=lambda m: _month_label(m, selected_tender["current_anchor_month"], anniversary_months),
                 )
                 check_month_is_anniversary = check_month in anniversary_months
                 st.markdown("---")
 
                 if is_annual and check_month_is_anniversary:
                     trigger_check = st.button("Run Monthly Check (preview, no registry change)")
-                    trigger_escalation = st.button("Run Annual Escalation (formal, resets anchor)")
+                    trigger_calculate_escalation = st.button("Calculate Annual Escalation (proposal only)")
                 else:
                     trigger_check = st.button("Run Monthly Check")
 
@@ -263,15 +313,22 @@ if trigger_anchor:
             )
             anchor_record = timeline_results[0]
 
+            # original_* is permanent from this point on -- never written
+            # again by anything in this app. current_* starts identical and
+            # is the only pair record_escalation() is ever allowed to move.
             save_tender({
                 "tender_id": tender_id,
                 "tender_name": tender_name,
-                "base_value": base_value,
+                "baseline_type": baseline_type,
+                "cpa_formula_type": cpa_formula_type,
                 "start_date": str(start_date),
                 "end_date": str(end_date),
-                "baseline_type": baseline_type,
-                "anchor_month": anchor_record["month"],
-                "anchor_cpi_value": anchor_record["anchor_cpi"],
+                "original_anchor_month": anchor_record["month"],
+                "original_anchor_cpi": anchor_record["anchor_cpi"],
+                "original_base_value": base_value,
+                "current_anchor_month": anchor_record["month"],
+                "current_anchor_cpi": anchor_record["anchor_cpi"],
+                "current_adjusted_price": base_value,
                 "created_at": datetime.datetime.now().isoformat(),
             })
 
@@ -297,16 +354,19 @@ if trigger_anchor:
 elif trigger_check and selected_tender and check_month:
     try:
         validator = SCMDataValidator(ARCHIVE_PATH)
+        # A non-mutating preview against whatever is CURRENTLY in effect --
+        # the original tender submission's anchor only matters for how
+        # Annual Escalation derives a new figure (see below), not for this.
         timeline_results, stage_results, extras, output_hash = validator.run_monthly_check(
-            anchor_month=selected_tender["anchor_month"],
-            anchor_cpi_value=selected_tender["anchor_cpi_value"],
+            anchor_month=selected_tender["current_anchor_month"],
+            anchor_cpi_value=selected_tender["current_anchor_cpi"],
             check_month=check_month,
             tender_id=selected_tender["tender_id"],
         )
         st.session_state["last_result"] = {
             "banner": None,
             "tender_id": selected_tender["tender_id"], "tender_name": selected_tender["tender_name"],
-            "baseline_type": selected_tender["baseline_type"], "base_value": selected_tender["base_value"],
+            "baseline_type": selected_tender["baseline_type"], "base_value": selected_tender["current_adjusted_price"],
             "start_date_str": selected_tender["start_date"], "end_date_str": selected_tender["end_date"],
             "timeline_results": timeline_results, "stage_results": stage_results,
             "extras": extras, "output_hash": output_hash,
@@ -317,56 +377,217 @@ elif trigger_check and selected_tender and check_month:
     except Exception as e:
         st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
 
-elif trigger_escalation and selected_tender and check_month:
+elif trigger_calculate_escalation and selected_tender and check_month:
+    # CALCULATE ONLY -- does not touch the registry. Neither the permanent
+    # original_* fields NOR the rolling current_* fields are written here;
+    # this only stashes a proposal in session_state until a separate,
+    # explicit approval step (below) applies it.
     try:
         # Re-validated server-side, not just gated by which buttons the UI
         # showed: an Annual Escalation is only legal on a true anniversary of
-        # the tender's CURRENT anchor, and can't be run against the anchor
-        # month itself.
-        current_anchor_month = selected_tender["anchor_month"]
+        # the tender's CURRENT anchor, and can't be run against that anchor
+        # month itself. Anniversaries are always counted from the CURRENT
+        # anchor (which, under normal one-escalation-per-year operation,
+        # stays 12 months apart from the original anchor anyway).
+        current_anchor_month = selected_tender["current_anchor_month"]
         if check_month == current_anchor_month:
-            raise ValueError(f"Cannot escalate a tender against its own anchor month ({current_anchor_month}).")
+            raise ValueError(f"Cannot escalate a tender against its own current anchor month ({current_anchor_month}).")
         months_diff = _months_since_anchor(current_anchor_month, check_month)
         if months_diff <= 0 or months_diff % 12 != 0:
             raise ValueError(f"{check_month} is not a 12-month anniversary of the current anchor "
                               f"({current_anchor_month}) -- Annual Escalation is only valid on anniversary months.")
 
+        # This is the whole formula distinction: CUMULATIVE always derives
+        # from the untouched original tender submission; COMPOUND derives
+        # from whatever the last approved escalation left as current.
+        formula_type = selected_tender.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL")
+        if formula_type == "CUMULATIVE_FROM_ORIGINAL":
+            calc_anchor_month = selected_tender["original_anchor_month"]
+            calc_anchor_cpi = selected_tender["original_anchor_cpi"]
+            calc_base_price = selected_tender["original_base_value"]
+        else:  # COMPOUND_FROM_PRIOR_YEAR
+            calc_anchor_month = selected_tender["current_anchor_month"]
+            calc_anchor_cpi = selected_tender["current_anchor_cpi"]
+            calc_base_price = selected_tender["current_adjusted_price"]
+
         validator = SCMDataValidator(ARCHIVE_PATH)
-        # This year's validated drift against the anchor being replaced --
-        # computed BEFORE the rollover, exactly like a real annual review.
+        # This year's validated drift against whichever anchor the formula
+        # calls for -- computed BEFORE any rollover, nothing written to the
+        # registry from this call.
         timeline_results, stage_results, extras, output_hash = validator.run_monthly_check(
-            anchor_month=current_anchor_month,
-            anchor_cpi_value=selected_tender["anchor_cpi_value"],
+            anchor_month=calc_anchor_month,
+            anchor_cpi_value=calc_anchor_cpi,
             check_month=check_month,
             tender_id=selected_tender["tender_id"],
         )
         drift_pct = timeline_results[-1]["drift_percentage"]
         new_cpi = timeline_results[-1]["current_cpi"]
-        old_base = selected_tender["base_value"]
-        new_base = old_base * (1 + drift_pct / 100)
+        new_adjusted_price = calc_base_price * (1 + drift_pct / 100)
 
-        updated = record_escalation(selected_tender["tender_id"], check_month, new_cpi, new_base)
-
-        st.session_state["last_result"] = {
-            "banner": f"Annual escalation recorded for '{updated['tender_id']}'. "
-                      f"New anchor: {check_month} @ CPI {new_cpi}. Registry updated.",
-            "tender_id": updated["tender_id"], "tender_name": updated["tender_name"],
-            "baseline_type": updated["baseline_type"],
-            "base_value": new_base,  # the document reflects the NEW base going forward
-            "start_date_str": updated["start_date"], "end_date_str": updated["end_date"],
-            "timeline_results": timeline_results, "stage_results": stage_results,
-            "extras": extras, "output_hash": output_hash,
-            "document_title": "Annual Contract Price Adjustment Record",
-            "escalation_info": {"effective_date": check_month, "old_base_zar": old_base, "new_base_zar": new_base},
+        st.session_state["pending_escalation"] = {
+            "tender_id": selected_tender["tender_id"],
+            "tender_name": selected_tender["tender_name"],
+            "baseline_type": selected_tender["baseline_type"],
+            "start_date": selected_tender["start_date"],
+            "end_date": selected_tender["end_date"],
+            "formula_type": formula_type,
+            "original_anchor_month": selected_tender["original_anchor_month"],
+            "original_anchor_cpi": selected_tender["original_anchor_cpi"],
+            "original_base_value": selected_tender["original_base_value"],
+            "prior_anchor_month": selected_tender["current_anchor_month"],
+            "prior_anchor_cpi": selected_tender["current_anchor_cpi"],
+            "prior_adjusted_price": selected_tender["current_adjusted_price"],
+            "calc_anchor_month": calc_anchor_month,
+            "calc_anchor_cpi": calc_anchor_cpi,
+            "calc_base_price": calc_base_price,
+            "new_anchor_month": check_month,
+            "new_anchor_cpi": new_cpi,
+            "new_adjusted_price": new_adjusted_price,
+            "drift_pct": drift_pct,
+            "pipeline_ok": all(s["status"] != "FAIL" for s in stage_results),
+            "calculated_at": datetime.datetime.now().isoformat(),
         }
     except ValueError as e:
         st.error(f"Validation Pipeline Halted: {e}")
     except Exception as e:
         st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
 
-# Renders whatever the most recent successful anchor/check produced. Lives
-# outside the trigger blocks above so it survives the reruns that clicking
-# either download button inside it causes (see comment above).
+# PENDING ANNUAL ESCALATION -- APPROVAL GATE
+# Shown regardless of current sidebar selection (not tied to selected_tender
+# / check_month) so a pending item survives the approver navigating around
+# to double check something before confirming. Nothing here has been
+# applied to the registry yet -- that only happens if "Confirm & Apply" is
+# clicked below, and only after a non-empty approver name/role is given.
+if "pending_escalation" in st.session_state:
+    pend = st.session_state["pending_escalation"]
+    is_compound = pend["formula_type"] == "COMPOUND_FROM_PRIOR_YEAR"
+
+    lines = [
+        f"PENDING ANNUAL ESCALATION for '{pend['tender_id']}' -- PROPOSED, NOT YET APPLIED.",
+        "",
+        f"Formula Type: {pend['formula_type']}",
+        "",
+        f"Original Baseline (permanent, {pend['original_anchor_month']}): "
+        f"CPI {pend['original_anchor_cpi']}, Base R{pend['original_base_value']:,.2f}",
+    ]
+    if is_compound:
+        lines += [
+            "",
+            f"Prior Year Adjusted Price ({pend['prior_anchor_month']}): "
+            f"CPI {pend['prior_anchor_cpi']}, Price R{pend['prior_adjusted_price']:,.2f}",
+        ]
+    lines += [
+        "",
+        f"This Year's New Adjusted Price ({pend['new_anchor_month']}): "
+        f"CPI {pend['new_anchor_cpi']}, Price R{pend['new_adjusted_price']:,.2f} "
+        f"(drift {pend['drift_pct']:+.4f}% from the "
+        f"{'original' if not is_compound else 'prior-year'} anchor)",
+        "",
+        f"10-Stage validation: {'PASSED' if pend['pipeline_ok'] else 'FAILED'}",
+    ]
+    st.markdown("---")
+    st.warning("\n\n".join(lines))
+
+    approver_name = st.text_input(
+        "Approver Name / Role (required to apply)", key="approver_input",
+        placeholder="e.g. J. Naidoo, SCM Manager",
+    )
+    confirm_col, discard_col = st.columns(2)
+    with confirm_col:
+        confirm_clicked = st.button("Confirm & Apply Annual Escalation")
+    with discard_col:
+        discard_clicked = st.button("Discard Pending Escalation")
+
+    if discard_clicked:
+        del st.session_state["pending_escalation"]
+        st.rerun()
+
+    if confirm_clicked:
+        if not approver_name or not approver_name.strip():
+            st.error("Approver Name / Role is required before an Annual Escalation can be applied.")
+        else:
+            try:
+                # Re-fetch and re-validate fresh at the moment of approval --
+                # don't just trust the numbers calculated earlier, in case
+                # the registry or archive changed in between. Only the
+                # CURRENT anchor is checked for drift -- original_* is
+                # permanent and can never have "changed" underneath us.
+                current = get_tender(pend["tender_id"])
+                if current is None:
+                    raise ValueError(f"Tender '{pend['tender_id']}' no longer exists in the registry.")
+                if current["current_anchor_month"] != pend["prior_anchor_month"]:
+                    raise ValueError(
+                        f"Tender '{pend['tender_id']}'s current anchor has changed since this was "
+                        f"calculated (now {current['current_anchor_month']}, "
+                        f"was {pend['prior_anchor_month']}) -- discard this proposal and recalculate."
+                    )
+
+                # Re-derive from scratch using the SAME formula-dependent
+                # base the calculate step used -- never trust the stashed
+                # pending numbers as the thing actually written to the
+                # registry.
+                if pend["formula_type"] == "CUMULATIVE_FROM_ORIGINAL":
+                    calc_anchor_month = current["original_anchor_month"]
+                    calc_anchor_cpi = current["original_anchor_cpi"]
+                    calc_base_price = current["original_base_value"]
+                else:
+                    calc_anchor_month = current["current_anchor_month"]
+                    calc_anchor_cpi = current["current_anchor_cpi"]
+                    calc_base_price = current["current_adjusted_price"]
+
+                validator = SCMDataValidator(ARCHIVE_PATH)
+                timeline_results, stage_results, extras, output_hash = validator.run_monthly_check(
+                    anchor_month=calc_anchor_month,
+                    anchor_cpi_value=calc_anchor_cpi,
+                    check_month=pend["new_anchor_month"],
+                    tender_id=pend["tender_id"],
+                )
+                drift_pct = timeline_results[-1]["drift_percentage"]
+                new_cpi = timeline_results[-1]["current_cpi"]
+                new_adjusted_price = calc_base_price * (1 + drift_pct / 100)
+                approved_at = datetime.datetime.now().isoformat()
+
+                updated = record_escalation(
+                    pend["tender_id"], pend["new_anchor_month"], new_cpi, new_adjusted_price,
+                    approved_by=approver_name.strip(),
+                )
+
+                st.session_state["last_result"] = {
+                    "banner": f"Annual escalation APPLIED for '{updated['tender_id']}'. "
+                              f"New current anchor: {pend['new_anchor_month']} @ CPI {new_cpi}. "
+                              f"Original baseline unchanged at {updated['original_anchor_month']} "
+                              f"@ CPI {updated['original_anchor_cpi']}. "
+                              f"Approved by {approver_name.strip()}.",
+                    "tender_id": updated["tender_id"], "tender_name": updated["tender_name"],
+                    "baseline_type": updated["baseline_type"],
+                    "base_value": new_adjusted_price,  # the document reflects the NEW price going forward
+                    "start_date_str": updated["start_date"], "end_date_str": updated["end_date"],
+                    "timeline_results": timeline_results, "stage_results": stage_results,
+                    "extras": extras, "output_hash": output_hash,
+                    "document_title": "Annual Contract Price Adjustment Record",
+                    "escalation_info": {
+                        "effective_date": pend["new_anchor_month"],
+                        "old_base_zar": calc_base_price, "new_base_zar": new_adjusted_price,
+                        "approved_by": approver_name.strip(), "approved_at": approved_at,
+                        "formula_type": pend["formula_type"],
+                        "original_anchor_month": updated["original_anchor_month"],
+                        "original_anchor_cpi": updated["original_anchor_cpi"],
+                        "original_base_zar": updated["original_base_value"],
+                        "prior_anchor_month": pend["prior_anchor_month"],
+                        "prior_adjusted_price": pend["prior_adjusted_price"],
+                    },
+                }
+                del st.session_state["pending_escalation"]
+                st.rerun()
+            except ValueError as e:
+                st.error(f"Validation Pipeline Halted: {e}")
+            except Exception as e:
+                st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
+
+# Renders whatever the most recent successful anchor/check/APPLIED escalation
+# produced. Lives outside the trigger blocks above so it survives the
+# reruns that clicking either download button inside it causes (see
+# comment above).
 if "last_result" in st.session_state:
     res = st.session_state["last_result"]
     if res["banner"]:

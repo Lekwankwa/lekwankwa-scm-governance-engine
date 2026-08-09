@@ -110,7 +110,34 @@ streamlit run app.py
 
 The sidebar's "Mode" selector splits the app into the two moments a real SCM audit actually has:
 
-- **Anchor New Tender** (Product 1, Inception Gateway) — enter tender metadata once, pick the execution/start date. Clicking **Anchor Tender** runs that single month through the full 10-stage gate, locks its CPI as the tender's permanent anchor, and writes the whole record to `data/tenders.json` via `core/tender_registry.py`. Re-anchoring an existing `tender_id` is refused — use the other mode to check it instead.
-- **Open Existing Tender** (Product 2/3, recurring audits) — pick a previously anchored tender from the registry (no metadata re-entry) and a check month from the CPI archive. Monthly-baseline tenders can pick any month on/after the anchor; annual-baseline tenders only see the 12-month anniversary dates. **Run Monthly Check** compares that month's CPI against the *locked* anchor value (not a freshly recomputed one — see `SCMDataValidator.run_monthly_check()`), still gated by the full 10-stage pipeline across the anchor-to-check-month span.
+- **Anchor New Tender** (Product 1, Inception Gateway) — enter tender metadata once, pick the execution/start date, and (for an annual-baseline tender) the CPA formula type — see below. Clicking **Anchor Tender** runs that month through the full 10-stage gate and writes the whole record to `data/tenders.json` via `core/tender_registry.py`. Re-anchoring an existing `tender_id` is refused — use the other mode to check it instead.
+- **Open Existing Tender** (Product 2/3, recurring audits) — pick a previously anchored tender from the registry (no metadata re-entry) and a check month from the CPI archive; the check-month picker shows every month on/after the tender's current anchor for both baseline types, labeling and defaulting to true 12-month anniversaries. **Run Monthly Check** is a non-mutating preview against whatever is currently in effect, gated by the full 10-stage pipeline.
 
-Both modes render through the same result panel and produce the same certified PDF/JSON export pair, keyed to whichever run (anchor or check) most recently succeeded.
+### Permanent original vs. rolling current (`core/tender_registry.py`)
+
+Every tender record keeps two distinct groups of fields:
+
+| Group | Fields | Behavior |
+|---|---|---|
+| **Permanent** | `original_anchor_month`, `original_anchor_cpi`, `original_base_value` | Set once at anchor time, **never written again** — the fixed reference point every year's escalation must trace back to |
+| **Rolling** | `current_anchor_month`, `current_anchor_cpi`, `current_adjusted_price` | Start identical to the originals; only `record_escalation()` ever moves them, and only after explicit approval |
+
+`cpa_formula_type` (set once at anchor, permanent) decides which group each year's Annual Escalation calculates from:
+
+- **`CUMULATIVE_FROM_ORIGINAL`** — always drifts from the permanent `original_anchor_cpi` and multiplies `original_base_value`, every year, regardless of history.
+- **`COMPOUND_FROM_PRIOR_YEAR`** — drifts from `current_anchor_cpi` and multiplies `current_adjusted_price`, i.e. compounds on top of whatever the last approved escalation produced.
+
+(These two are mathematically equivalent for an unbroken chain of full-precision escalations — CPI ratios telescope — so they only diverge in practice once rounding, caps, or skipped years enter the picture. Both are implemented as asked; which one a real contract needs depends on its actual CPA clause wording.)
+
+### Annual Escalation is approval-gated, not automatic
+
+Reaching an anniversary month never changes anything by itself:
+
+1. **Calculate Annual Escalation** computes the proposed new anchor/CPI/adjusted-price (per the tender's formula type) and shows it as a **"PENDING ANNUAL ESCALATION — PROPOSED, NOT YET APPLIED"** panel. Nothing is written to the registry yet.
+2. A named **Approver Name / Role** is required before anything can be applied — the button is refused without one.
+3. **Confirm & Apply Annual Escalation** re-validates and re-derives the figures fresh (never trusting the stashed pending numbers), then calls `record_escalation()`, which appends the full derivation — formula type, prior figures, new figures, approver, timestamp — to that tender's `escalation_history` and moves only the rolling `current_*` fields. The permanent `original_*` fields are untouched.
+4. Every subsequent check reads the new `current_*` figures automatically.
+
+Both the pending preview and the applied PDF/JSON always show the full chain: the original baseline (unchanged), the prior year's adjusted price (for a compounding tender), this year's new adjusted price, and which formula produced it — so an auditor can trace current price back to the original tender submission in one document.
+
+All outputs — anchor, monthly check, and applied escalation — render through the same result panel and produce the same certified PDF/JSON export pair, keyed to whichever action most recently succeeded, with a `document_title` that names what actually happened ("Tender Anchor Record" / "Monthly Invoice Verification Record" / "Annual Contract Price Adjustment Record").

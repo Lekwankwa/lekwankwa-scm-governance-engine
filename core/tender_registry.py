@@ -11,6 +11,22 @@ Storage: a single JSON object keyed by tender_id (the schema's declared
 primary key), at data/tenders.json. Keying by tender_id both gives O(1)
 lookup and makes duplicate-ID collisions a normal dict overwrite that
 app.py can guard against explicitly (see tender_exists()).
+
+Each record has two distinct groups of fields, per the CPA (Contract Price
+Adjustment) formula requirement that every year's escalation must be
+traceable back to the original tender submission:
+
+  PERMANENT (set once at anchor time in app.py, never written again):
+    original_anchor_month, original_anchor_cpi, original_base_value
+
+  ROLLING (start equal to the originals; updated only by record_escalation()
+  below, only after explicit clerk/approver confirmation in app.py):
+    current_anchor_month, current_anchor_cpi, current_adjusted_price
+
+  cpa_formula_type (also set once at anchor time, one of
+  "CUMULATIVE_FROM_ORIGINAL" | "COMPOUND_FROM_PRIOR_YEAR") decides which of
+  the two groups app.py uses as the base for each year's escalation
+  calculation -- see app.py's Calculate Annual Escalation branch.
 """
 from __future__ import annotations
 
@@ -52,37 +68,57 @@ def tender_exists(tender_id: str, path: Path = REGISTRY_PATH) -> bool:
 
 
 def record_escalation(tender_id: str, new_anchor_month: str, new_anchor_cpi_value: float,
-                       new_base_value: float, path: Path = REGISTRY_PATH) -> dict:
-    """Roll a tender's anchor forward after a formal Annual Escalation.
+                       new_adjusted_price: float, approved_by: str, path: Path = REGISTRY_PATH) -> dict:
+    """Roll a tender's CURRENT (not original) anchor forward after an
+    APPROVED Annual Escalation.
 
-    Appends the OLD anchor/base as one entry in the tender's
-    escalation_history (nothing is silently overwritten -- the full
-    multi-year chain stays auditable), then updates the top-level
-    anchor_month / anchor_cpi_value / base_value to the new figures.
+    This is the apply step of a two-step workflow: app.py calculates a
+    proposed new adjusted price first and shows it as a "Pending Annual
+    Escalation" (nothing here yet -- the tender is untouched), and only
+    calls this function once a clerk/approver has explicitly confirmed it.
+    approved_by is required (not optional) because an escalation with no
+    recorded approver defeats the point of gating it.
 
-    Every subsequent get_tender() call -- including the ones
-    SCMDataValidator.run_monthly_check() is fed from in app.py -- sees the
-    new floor automatically from this point on, mirroring how each year's
-    adjustment becomes the new floor for the next year in a real multi-year
-    contract.
+    original_anchor_month / original_anchor_cpi / original_base_value are
+    NEVER touched here -- they stay fixed for the life of the contract as
+    the permanent reference point every year's calculation must trace back
+    to (see module docstring). Only current_anchor_month /
+    current_anchor_cpi / current_adjusted_price roll forward, alongside one
+    new escalation_history entry recording the full derivation (formula
+    type, what the prior figures were, what the new ones are, who approved
+    it and when) -- nothing is silently overwritten, the full multi-year
+    chain stays auditable.
+
+    Every subsequent get_tender() call sees the new current_* figures from
+    this point on -- for CUMULATIVE_FROM_ORIGINAL tenders this only affects
+    ongoing monthly-check previews (the next escalation still calculates
+    from the untouched originals); for COMPOUND_FROM_PRIOR_YEAR tenders it
+    also becomes the base the NEXT escalation compounds on top of.
     """
+    if not approved_by or not approved_by.strip():
+        raise ValueError("approved_by is required to apply an Annual Escalation.")
+
     record = get_tender(tender_id, path)
     if record is None:
         raise KeyError(f"Tender '{tender_id}' not found in registry.")
 
     history_entry = {
-        "from_month": record["anchor_month"],
-        "from_cpi": record["anchor_cpi_value"],
-        "from_base_value": record["base_value"],
-        "to_month": new_anchor_month,
-        "to_cpi": new_anchor_cpi_value,
-        "to_base_value": new_base_value,
+        "formula_type": record.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL"),
+        "prior_anchor_month": record["current_anchor_month"],
+        "prior_anchor_cpi": record["current_anchor_cpi"],
+        "prior_adjusted_price": record["current_adjusted_price"],
+        "new_anchor_month": new_anchor_month,
+        "new_anchor_cpi": new_anchor_cpi_value,
+        "new_adjusted_price": new_adjusted_price,
+        "approved_by": approved_by.strip(),
         "escalated_at": datetime.now().isoformat(),
     }
     record.setdefault("escalation_history", []).append(history_entry)
-    record["anchor_month"] = new_anchor_month
-    record["anchor_cpi_value"] = new_anchor_cpi_value
-    record["base_value"] = new_base_value
+    record["current_anchor_month"] = new_anchor_month
+    record["current_anchor_cpi"] = new_anchor_cpi_value
+    record["current_adjusted_price"] = new_adjusted_price
+    # original_anchor_month / original_anchor_cpi / original_base_value:
+    # deliberately not touched. See module + function docstrings.
 
     save_tender(record, path)
     return record
