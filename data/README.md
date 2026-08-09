@@ -13,6 +13,7 @@ ingested directly from Stats SA's own published time series.
 | Ingested by | `core/harvester.py` |
 | Ingested on | 2026-08-09 |
 | Coverage | 2024-07 .. 2026-06 (24 months) |
+| Cross-checked against | Official P0141 "Consumer Price Index, June 2026" bulletin (embargoed 22 Jul 2026), Table 1 "Consumer price indices for the total country" — All Items row: Jun 2025 = 102,4, May 2026 = 106,6, Jun 2026 = 107,3. All three exact matches against this file's Jun-2025/May-2026/Jun-2026 rows, confirming `core/harvester.py` is pulling the correct headline series (not a mislabeled sub-index). |
 
 Re-run the harvester at any time to refresh the window to the latest
 release Stats SA has published:
