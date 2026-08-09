@@ -15,6 +15,7 @@ app.py can guard against explicitly (see tender_exists()).
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 REGISTRY_PATH = Path("data") / "tenders.json"
@@ -48,3 +49,40 @@ def list_tenders(path: Path = REGISTRY_PATH) -> list:
 
 def tender_exists(tender_id: str, path: Path = REGISTRY_PATH) -> bool:
     return tender_id in load_registry(path)
+
+
+def record_escalation(tender_id: str, new_anchor_month: str, new_anchor_cpi_value: float,
+                       new_base_value: float, path: Path = REGISTRY_PATH) -> dict:
+    """Roll a tender's anchor forward after a formal Annual Escalation.
+
+    Appends the OLD anchor/base as one entry in the tender's
+    escalation_history (nothing is silently overwritten -- the full
+    multi-year chain stays auditable), then updates the top-level
+    anchor_month / anchor_cpi_value / base_value to the new figures.
+
+    Every subsequent get_tender() call -- including the ones
+    SCMDataValidator.run_monthly_check() is fed from in app.py -- sees the
+    new floor automatically from this point on, mirroring how each year's
+    adjustment becomes the new floor for the next year in a real multi-year
+    contract.
+    """
+    record = get_tender(tender_id, path)
+    if record is None:
+        raise KeyError(f"Tender '{tender_id}' not found in registry.")
+
+    history_entry = {
+        "from_month": record["anchor_month"],
+        "from_cpi": record["anchor_cpi_value"],
+        "from_base_value": record["base_value"],
+        "to_month": new_anchor_month,
+        "to_cpi": new_anchor_cpi_value,
+        "to_base_value": new_base_value,
+        "escalated_at": datetime.now().isoformat(),
+    }
+    record.setdefault("escalation_history", []).append(history_entry)
+    record["anchor_month"] = new_anchor_month
+    record["anchor_cpi_value"] = new_anchor_cpi_value
+    record["base_value"] = new_base_value
+
+    save_tender(record, path)
+    return record

@@ -16,6 +16,10 @@ Usage:
         lineage=extras.get("lineage", {}),
         outliers=extras.get("outliers", []),
         output_hash=output_hash,
+        document_title="Monthly Invoice Verification Record",  # or "Tender Anchor
+            # Record" / "Annual Contract Price Adjustment Record" -- see build_audit_pdf()
+        escalation_info=None,  # dict with effective_date/old_base_zar/new_base_zar for
+            # a formal Annual Escalation record, otherwise None
     )
 """
 from __future__ import annotations
@@ -55,13 +59,19 @@ def _safe(text) -> str:
 
 
 class AuditPDF(FPDF):
+    # Overridden per-instance right after construction (see build_audit_pdf)
+    # so header(), which FPDF calls automatically on every page, can render
+    # a title that differs by record type (anchor vs monthly check vs
+    # annual escalation) instead of one hardcoded subtitle.
+    document_title = "Audit-Ready Compliance Record"
+
     def header(self):
         self.set_font("Helvetica", "B", 14)
         self.set_text_color(*ACCENT)
         self.cell(0, 8, _safe("Lekwankwa Municipal SCM Governance Engine"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         self.set_font("Helvetica", "", 10)
         self.set_text_color(90, 90, 90)
-        self.cell(0, 6, _safe("Audit-Ready Compliance Record"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.cell(0, 6, _safe(self.document_title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         self.set_draw_color(200, 200, 200)
         self.line(10, self.get_y() + 2, 200, self.get_y() + 2)
         self.ln(6)
@@ -99,14 +109,43 @@ def build_audit_pdf(
     lineage: dict = None,
     outliers: list = None,
     output_hash: str = "N/A",
+    document_title: str = "Audit-Ready Compliance Record",
+    escalation_info: dict = None,
 ) -> bytes:
+    """
+    document_title distinguishes what kind of record this is -- different
+    purpose, different legal weight, different downstream effect on the
+    contract -- e.g. "Tender Anchor Record", "Monthly Invoice Verification
+    Record", or "Annual Contract Price Adjustment Record".
+
+    escalation_info, when set, is a dict with effective_date, old_base_zar,
+    new_base_zar: a formal Annual Escalation actually changes the contract's
+    baseline value, so that gets its own explicit notice section up front
+    rather than being buried in the metadata table.
+    """
     lineage = lineage or {}
     outliers = outliers or []
 
     pdf = AuditPDF()
+    pdf.document_title = document_title
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
+
+    if escalation_info:
+        pdf.set_draw_color(*ACCENT)
+        pdf.set_fill_color(255, 245, 225)
+        pdf.set_font("Helvetica", "B", 10.5)
+        pdf.set_text_color(0, 0, 0)
+        notice = (
+            "This is a formal annual price adjustment. Effective "
+            f"{escalation_info['effective_date']}, the contract's baseline value "
+            f"is revised from R{escalation_info['old_base_zar']:,.2f} to "
+            f"R{escalation_info['new_base_zar']:,.2f}."
+        )
+        pdf.multi_cell(0, 7, _safe(notice), border=1, fill=True,
+                        new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(4)
 
     # ── Tender metadata ──────────────────────────────────────────────────
     _section_title(pdf, "1. Tender Metadata")
@@ -129,7 +168,7 @@ def build_audit_pdf(
         drift_pct = latest["drift_percentage"]
         approved_max_payout = base_zar * (1 + drift_pct / 100)
         _kv_table(pdf, [
-            ("Month 1 Anchor CPI", f"{anchor['anchor_cpi']} ({anchor['month']})"),
+            ("Anchor CPI", f"{anchor['anchor_cpi']} ({anchor.get('anchor_month', anchor['month'])})"),
             ("Current Vintage CPI", f"{latest['current_cpi']} ({latest['month']})"),
             ("Cumulative Drift %", f"{drift_pct:+.4f}%"),
             ("Approved Maximum Payout (ZAR)", f"{approved_max_payout:,.2f}"),

@@ -2,7 +2,7 @@
 
 This technical blueprint maps out the complete, functional architecture for your 1-day Product 1 (Inception Gateway) build, while natively accommodating the timeline and database fields required to drive your Product 2 and Product 3 roadmaps.
 
-> **Note on `core/validator.py`:** the 10-Stage Data Integrity Engine in this repo is built as a scaled-down but faithful port of the real 10-stage validation pipeline used across the Lekwankwa data platform (`lek_scraper/validations/`) — same 10 stage names/order (1a, 1b, 1c, 2, 3, 4, 5, 6, 7, 8: Bitemporal Core → Temporal Consistency → Temporal Coverage Audit → Sanity Checks → Schema Compliance → Referential Integrity → Lineage & Provenance → Outlier Extraction → Changelog Generation → Source Identity Verification), adapted from a Parquet vault down to this MVP's single flat Stats SA CPI archive CSV. See the "10-Stage Automated Pipeline Visualization" table below for what each stage means here.
+> **Note on `core/validator.py`:** the 10-Stage Data Integrity Engine in this repo is built as a scaled-down port of the real 10-stage validation pipeline used across the Lekwankwa data platform (`lek_scraper/validations/`) — same 10 stage positions/order (1a, 1b, 1c, 2, 3, 4, 5, 6, 7, 8: Temporal Sanity Check → Temporal Consistency → Temporal Coverage Audit → Sanity Checks → Schema Compliance → Referential Integrity → Lineage & Provenance → Outlier Extraction → Changelog Generation → Column Signature Check), adapted from a Parquet vault down to this MVP's single flat Stats SA CPI archive CSV. Stages 1a and 8 are named differently from the real platform's pipeline on purpose — this MVP doesn't implement true bitemporal/point-in-time tracking or source-identity verification, so the labels describe what's actually checked instead of borrowing names for depth it doesn't have. See the "10-Stage Automated Pipeline Visualization" table below for what each stage means here.
 
 ```
                                  [ SYSTEM DATA FLOW LAYER ]
@@ -29,7 +29,7 @@ Lekwankwa SCM Governance Engine/
 │       └── monthly_harvest.yml      # GitHub Actions automation pipeline (placeholder)
 │
 ├── data/
-│   ├── stats_sa_cpi_archive.csv     # 2-Year historical Point-in-Time CSV vault (real Stats SA data, 2024-07..2026-06)
+│   ├── stats_sa_cpi_archive.csv     # 2-Year historical CSV vault (real Stats SA data, 2024-07..2026-06)
 │   ├── tenders.json                 # Tender registry — generated at runtime, one entry per anchored tender
 │   └── README.md                    # Provenance: exact source URL, series code, ingestion date
 │
@@ -84,7 +84,7 @@ The maximum legal payout allowed for any invoice check (Product 2 & 3) is bounde
 
 | Stage | Name | What it checks against the flat CSV archive |
 |---|---|---|
-| 1a | Bitemporal Core (PIT Validation) | `Date` parses as `YYYY-MM`; no duplicate Date rows; no row dated in the future |
+| 1a | Temporal Sanity Check | `Date` parses as `YYYY-MM`; no duplicate Date rows; no row dated in the future |
 | 1b | Temporal Consistency | Rows strictly ascending by Date, no duplicates/out-of-order entries |
 | 1c | Temporal Coverage Audit | Every month between contract start and end exists in the archive; gaps reported as DATA_GAP |
 | 2 | Sanity Checks | Null/non-positive CPI values; duplicate keys; month-over-month outlier flagging |
@@ -93,7 +93,7 @@ The maximum legal payout allowed for any invoice check (Product 2 & 3) is bounde
 | 5 | Lineage & Provenance | Records archive file path, last-modified time, row count |
 | 6 | Outlier Extraction | Hyper-inflation filter (`CPI_Value > 250`) — extracted rows are reported, not silently dropped |
 | 7 | Changelog Generation | Appends a JSON-lines audit entry per run to `data/scm_run_changelog.jsonl` |
-| 8 | Source Identity Verification | Confirms the CSV's column signature matches the declared Stats SA CPI archive identity |
+| 8 | Column Signature Check | Confirms the CSV's column signature matches the declared Stats SA CPI archive identity |
 
 ## 🛠️ 5. Running the Demo
 

@@ -1,12 +1,15 @@
 """
 SCMDataValidator — the 10-Stage Data Integrity Engine.
 
-This is a scaled-down, faithful port of the 10-stage validation pipeline used
-across the Lekwankwa data platform (see lek_scraper/validations/), adapted
-from a Parquet vault + multi-source setup down to this MVP's single flat CSV
-of Stats SA CPI history. Same 10 stage names, same order, same intent:
+This is a scaled-down port of the 10-stage validation pipeline used across
+the Lekwankwa data platform (see lek_scraper/validations/), adapted from a
+Parquet vault + multi-source setup down to this MVP's single flat CSV of
+Stats SA CPI history. Same 10 stage positions/order and mostly the same
+names -- except stages 1a and 8, renamed below to describe what this MVP's
+version actually checks rather than borrowing the real platform's names for
+depth this scaled-down port doesn't have (see those methods' docstrings):
 
-  1a  Bitemporal Core (PIT Validation)
+  1a  Temporal Sanity Check
   1b  Temporal Consistency
   1c  Temporal Coverage Audit
   2   Sanity Checks
@@ -15,7 +18,7 @@ of Stats SA CPI history. Same 10 stage names, same order, same intent:
   5   Lineage & Provenance
   6   Outlier Extraction
   7   Changelog Generation
-  8   Source Identity Verification
+  8   Column Signature Check
 
 Each stage method returns a dict shaped like:
     {"stage": "1a", "name": "...", "status": "PASS" | "WARN" | "FAIL", "detail": "..."}
@@ -95,31 +98,40 @@ class SCMDataValidator:
         if "Date" in self.archive_df.columns:
             self.archive_df["Date"] = self.archive_df["Date"].astype(str)
 
-    # ── Stage 1a — Bitemporal Core (PIT Validation) ─────────────────────────
-    def stage_1a_bitemporal_pit(self):
+    # ── Stage 1a — Temporal Sanity Check ─────────────────────────────────────
+    def stage_1a_temporal_sanity(self):
+        """Checks Date well-formedness, uniqueness, and non-future-dating.
+
+        Named "Temporal Sanity Check" rather than a bitemporal/point-in-time
+        term on purpose: this does NOT track as-of/knowledge dates or prove a
+        locked value was later confirmed unchanged (or would catch one that
+        changed) -- it can't, since this MVP only ever holds the CSV's current
+        state, not a history of prior versions. Don't call this bitemporal or
+        PIT validation until the system is actually capturing that history.
+        """
         df = self.archive_df
         if "Date" not in df.columns:
-            return _stage("1a", "Bitemporal Core (PIT Validation)", "FAIL",
-                           "Date column missing — cannot verify point-in-time integrity.")
+            return _stage("1a", "Temporal Sanity Check", "FAIL",
+                           "Date column missing — cannot verify temporal well-formedness.")
 
         bad_dates = [d for d in df["Date"] if not re.fullmatch(r"\d{4}-\d{2}", str(d))]
         if bad_dates:
-            return _stage("1a", "Bitemporal Core (PIT Validation)", "FAIL",
+            return _stage("1a", "Temporal Sanity Check", "FAIL",
                            f"{len(bad_dates)} row(s) with malformed Date (expected YYYY-MM): {bad_dates[:5]}")
 
         dupes = df["Date"][df["Date"].duplicated()].tolist()
         if dupes:
-            return _stage("1a", "Bitemporal Core (PIT Validation)", "FAIL",
+            return _stage("1a", "Temporal Sanity Check", "FAIL",
                            f"Duplicate Date record(s) — not unique record IDs: {dupes[:5]}")
 
         today_month = datetime.now().strftime("%Y-%m")
         future_rows = [d for d in df["Date"] if d > today_month]
         if future_rows:
-            return _stage("1a", "Bitemporal Core (PIT Validation)", "WARN",
+            return _stage("1a", "Temporal Sanity Check", "WARN",
                            f"{len(future_rows)} row(s) dated after the current month — "
-                           f"possible look-ahead / anti-retroactive violation: {future_rows[:5]}")
+                           f"future-dated entries are not valid for a historical archive: {future_rows[:5]}")
 
-        return _stage("1a", "Bitemporal Core (PIT Validation)", "PASS",
+        return _stage("1a", "Temporal Sanity Check", "PASS",
                        f"{len(df)} unique, well-formed, non-future-dated records.")
 
     # ── Stage 1b — Temporal Consistency ─────────────────────────────────────
@@ -214,7 +226,13 @@ class SCMDataValidator:
             "last_modified": mtime,
             "row_count": len(self.archive_df),
         }
-        return _stage("5", "Lineage & Provenance", "PASS", json.dumps(lineage)), lineage
+        # Plain-text sentence, matching every other stage's detail style --
+        # the structured version of this data lives in the returned `lineage`
+        # dict / the JSON export's top-level "lineage" object, not here.
+        detail = (f"Source file: {lineage['source_file']}; "
+                  f"last modified: {lineage['last_modified']}; "
+                  f"row count: {lineage['row_count']}.")
+        return _stage("5", "Lineage & Provenance", "PASS", detail), lineage
 
     # ── Stage 6 — Outlier Extraction ────────────────────────────────────────
     def stage_6_outlier_extraction(self):
@@ -243,14 +261,21 @@ class SCMDataValidator:
         except OSError as exc:
             return _stage("7", "Changelog Generation", "WARN", f"Could not write changelog: {exc}")
 
-    # ── Stage 8 — Source Identity Verification ──────────────────────────────
-    def stage_8_source_identity_verification(self):
+    # ── Stage 8 — Column Signature Check ─────────────────────────────────────
+    def stage_8_column_signature_check(self):
+        """Confirms the archive's first two columns are exactly ["Date", "CPI_Value"].
+
+        Named "Column Signature Check" rather than "Source Identity
+        Verification" on purpose: this only compares two column headers, not
+        a checksum or a live cross-check against Stats SA -- it catches an
+        obviously wrong file being swapped in, not a subtly tampered one.
+        """
         actual_columns = list(self.archive_df.columns)
         if actual_columns[:2] != REQUIRED_COLUMNS:
-            return _stage("8", "Source Identity Verification", "FAIL",
+            return _stage("8", "Column Signature Check", "FAIL",
                            f"Column signature mismatch — expected {REQUIRED_COLUMNS}, got {actual_columns}. "
                            "This file may not be the genuine Stats SA CPI Historical Archive.")
-        return _stage("8", "Source Identity Verification", "PASS",
+        return _stage("8", "Column Signature Check", "PASS",
                        f"Column signature matches declared identity '{SOURCE_IDENTITY_SIGNATURE}'.")
 
     # ── Orchestrator ─────────────────────────────────────────────────────────
@@ -263,7 +288,7 @@ class SCMDataValidator:
             results.append(result)
             return result["status"] != "FAIL"
 
-        if not record(self.stage_1a_bitemporal_pit()):
+        if not record(self.stage_1a_temporal_sanity()):
             return results, False, extras
         if not record(self.stage_1b_temporal_consistency()):
             return results, False, extras
@@ -286,7 +311,7 @@ class SCMDataValidator:
 
         results.append(self.stage_7_changelog_generation(tender_id, output_hash))
 
-        if not record(self.stage_8_source_identity_verification()):
+        if not record(self.stage_8_column_signature_check()):
             return results, False, extras
 
         return results, True, extras
@@ -339,6 +364,7 @@ class SCMDataValidator:
             drift_pct = ((current_cpi / month_1_anchor) - 1) * 100
             processed_records.append({
                 "month": row["Date"],
+                "anchor_month": start_lookup,
                 "anchor_cpi": month_1_anchor,
                 "current_cpi": current_cpi,
                 "drift_percentage": round(drift_pct, 4),
@@ -397,6 +423,7 @@ class SCMDataValidator:
         drift_pct = ((current_cpi / anchor_cpi_value) - 1) * 100
         record = {
             "month": check_month,
+            "anchor_month": anchor_month,
             "anchor_cpi": anchor_cpi_value,
             "current_cpi": current_cpi,
             "drift_percentage": round(drift_pct, 4),

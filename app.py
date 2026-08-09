@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from core.validator import SCMDataValidator
-from core.tender_registry import get_tender, list_tenders, save_tender, tender_exists
+from core.tender_registry import get_tender, list_tenders, record_escalation, save_tender, tender_exists
 from utils.document_gen import build_audit_pdf
 
 ARCHIVE_PATH = "data/stats_sa_cpi_archive.csv"
@@ -18,40 +18,68 @@ st.subheader("Data-Driven Procurement Protection and Internal Audit Control Gate
 st.markdown("---")
 
 
-def _anniversary_months(anchor_month: str, available_months: list) -> list:
-    """Months that are exact 12-month multiples on/after anchor_month.
-
-    Used to restrict the check-month picker for annually-billed tenders to
-    only the dates that are legally meaningful escalation points, instead of
-    letting a Product 3 (Annual Anniversary Engine) tender be checked against
-    an arbitrary mid-year month.
-    """
+def _months_since_anchor(anchor_month: str, month: str) -> int:
     anchor_dt = datetime.datetime.strptime(anchor_month, "%Y-%m")
+    m_dt = datetime.datetime.strptime(month, "%Y-%m")
+    return (m_dt.year - anchor_dt.year) * 12 + (m_dt.month - anchor_dt.month)
+
+
+def _anniversary_months(anchor_month: str, available_months: list) -> list:
+    """Months that are strict 12-month multiples AFTER anchor_month (not the
+    anchor month itself -- it isn't an anniversary of itself, and Task 3's
+    escalation-eligibility check reuses this same function, where checking
+    the anchor month against itself must not count as an eligible target).
+
+    Used to both label these dates in the check-month picker and to gate
+    whether "Run Annual Escalation" is offered for the selected month.
+    """
     result = []
     for m in available_months:
-        m_dt = datetime.datetime.strptime(m, "%Y-%m")
-        months_diff = (m_dt.year - anchor_dt.year) * 12 + (m_dt.month - anchor_dt.month)
-        if months_diff >= 0 and months_diff % 12 == 0:
+        months_diff = _months_since_anchor(anchor_month, m)
+        if months_diff > 0 and months_diff % 12 == 0:
             result.append(m)
     return result
 
 
+def _month_label(month: str, anchor_month: str, anniversary_months: set) -> str:
+    if month in anniversary_months:
+        year_n = _months_since_anchor(anchor_month, month) // 12
+        return f"Year {year_n} Anniversary - {month}"
+    return month
+
+
 def render_result_block(tender_id, tender_name, baseline_type, base_value,
                           start_date_str, end_date_str, timeline_results,
-                          stage_results, extras, output_hash):
-    """Shared output rendering for both the anchor event and every later
+                          stage_results, extras, output_hash,
+                          document_title="Audit-Ready Compliance Record",
+                          escalation_info=None):
+    """Shared output rendering for the anchor event and every later
     monthly/annual check -- metrics, the real 10-stage panel, the results
     table, and the PDF/JSON downloads. Used identically by "Anchor New
     Tender" and "Open Existing Tender" so a check never needs its own
     separate rendering path.
+
+    document_title / escalation_info: different purpose, different legal
+    weight, different downstream effect on the contract -- see
+    utils/document_gen.py's build_audit_pdf() docstring for the full
+    explanation. escalation_info, when set, is a dict with effective_date,
+    old_base_zar, new_base_zar for a formal Annual Escalation.
     """
     inception_data = timeline_results[0]
     latest_data = timeline_results[-1]
 
+    if escalation_info:
+        st.warning(
+            "This is a formal annual price adjustment. Effective "
+            f"{escalation_info['effective_date']}, the contract's baseline value "
+            f"is revised from R{escalation_info['old_base_zar']:,.2f} to "
+            f"R{escalation_info['new_base_zar']:,.2f}."
+        )
+
     # METRIC DISPLAY MATRIX (Top Layer Visualization)
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Anchor CPI", f"{inception_data['anchor_cpi']}")
+        st.metric("Anchor CPI", f"{inception_data['anchor_cpi']} ({inception_data.get('anchor_month', inception_data['month'])})")
     with col2:
         st.metric("Current Vintage CPI", f"{latest_data['current_cpi']} ({latest_data['month']})")
     with col3:
@@ -102,12 +130,14 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
     }
 
     gold_standard_json = {
+        "record_type": document_title,
         "tender_metadata": tender_metadata,
         "validation_pipeline": stage_results,
         "lineage": extras.get("lineage", {}),
         "outliers": extras.get("outliers", []),
         "output_hash": output_hash,
         "audit_lineage": timeline_results,
+        "escalation": escalation_info,
     }
     json_bytes = json.dumps(gold_standard_json, indent=4, default=str).encode("utf-8")
 
@@ -117,6 +147,8 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         timeline_results=timeline_results,
         lineage=extras.get("lineage", {}),
         outliers=extras.get("outliers", []),
+        document_title=document_title,
+        escalation_info=escalation_info,
         output_hash=output_hash,
     )
 
@@ -145,8 +177,10 @@ with st.sidebar:
 
     trigger_anchor = False
     trigger_check = False
+    trigger_escalation = False
     selected_tender = None
     check_month = None
+    check_month_is_anniversary = False
 
     if registry_mode == "Anchor New Tender":
         st.header("Tender Configuration Panel")
@@ -182,17 +216,35 @@ with st.sidebar:
             st.caption(f"Anchor: {selected_tender['anchor_month']} @ CPI {selected_tender['anchor_cpi_value']}")
             st.caption(f"Base Value (ZAR): {selected_tender['base_value']:,.2f}")
 
+            # Every month on/after the anchor is selectable for BOTH baseline
+            # types -- an annual tender isn't limited to its anniversary date,
+            # that's just the one that gets highlighted/defaulted to, and the
+            # only one "Run Annual Escalation" is offered for (see below).
             archive_dates = pd.read_csv(ARCHIVE_PATH)["Date"].astype(str).tolist()
             eligible_months = [d for d in archive_dates if d >= selected_tender["anchor_month"]]
-            if selected_tender["baseline_type"] == "Total Annual Contract Allocation Value":
-                eligible_months = _anniversary_months(selected_tender["anchor_month"], eligible_months)
+            anniversary_months = set(_anniversary_months(selected_tender["anchor_month"], eligible_months))
+            is_annual = selected_tender["baseline_type"] == "Total Annual Contract Allocation Value"
 
             if not eligible_months:
-                st.info("No eligible check month yet for this tender's baseline type.")
+                st.info("No eligible check month yet for this tender.")
             else:
-                check_month = st.selectbox("Select Check Month", eligible_months, index=len(eligible_months) - 1)
+                default_index = len(eligible_months) - 1
+                if is_annual and anniversary_months:
+                    latest_anniversary = max(anniversary_months)
+                    default_index = eligible_months.index(latest_anniversary)
+
+                check_month = st.selectbox(
+                    "Select Check Month", eligible_months, index=default_index,
+                    format_func=lambda m: _month_label(m, selected_tender["anchor_month"], anniversary_months),
+                )
+                check_month_is_anniversary = check_month in anniversary_months
                 st.markdown("---")
-                trigger_check = st.button("Run Monthly Check")
+
+                if is_annual and check_month_is_anniversary:
+                    trigger_check = st.button("Run Monthly Check (preview, no registry change)")
+                    trigger_escalation = st.button("Run Annual Escalation (formal, resets anchor)")
+                else:
+                    trigger_check = st.button("Run Monthly Check")
 
 # MAIN FRAME PROCESSING GRAPHICS
 if trigger_anchor:
@@ -235,6 +287,7 @@ if trigger_anchor:
                 "base_value": base_value, "start_date_str": str(start_date), "end_date_str": str(end_date),
                 "timeline_results": timeline_results, "stage_results": stage_results,
                 "extras": extras, "output_hash": output_hash,
+                "document_title": "Tender Anchor Record", "escalation_info": None,
             }
         except ValueError as e:
             st.error(f"Validation Pipeline Halted: {e}")
@@ -257,6 +310,54 @@ elif trigger_check and selected_tender and check_month:
             "start_date_str": selected_tender["start_date"], "end_date_str": selected_tender["end_date"],
             "timeline_results": timeline_results, "stage_results": stage_results,
             "extras": extras, "output_hash": output_hash,
+            "document_title": "Monthly Invoice Verification Record", "escalation_info": None,
+        }
+    except ValueError as e:
+        st.error(f"Validation Pipeline Halted: {e}")
+    except Exception as e:
+        st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
+
+elif trigger_escalation and selected_tender and check_month:
+    try:
+        # Re-validated server-side, not just gated by which buttons the UI
+        # showed: an Annual Escalation is only legal on a true anniversary of
+        # the tender's CURRENT anchor, and can't be run against the anchor
+        # month itself.
+        current_anchor_month = selected_tender["anchor_month"]
+        if check_month == current_anchor_month:
+            raise ValueError(f"Cannot escalate a tender against its own anchor month ({current_anchor_month}).")
+        months_diff = _months_since_anchor(current_anchor_month, check_month)
+        if months_diff <= 0 or months_diff % 12 != 0:
+            raise ValueError(f"{check_month} is not a 12-month anniversary of the current anchor "
+                              f"({current_anchor_month}) -- Annual Escalation is only valid on anniversary months.")
+
+        validator = SCMDataValidator(ARCHIVE_PATH)
+        # This year's validated drift against the anchor being replaced --
+        # computed BEFORE the rollover, exactly like a real annual review.
+        timeline_results, stage_results, extras, output_hash = validator.run_monthly_check(
+            anchor_month=current_anchor_month,
+            anchor_cpi_value=selected_tender["anchor_cpi_value"],
+            check_month=check_month,
+            tender_id=selected_tender["tender_id"],
+        )
+        drift_pct = timeline_results[-1]["drift_percentage"]
+        new_cpi = timeline_results[-1]["current_cpi"]
+        old_base = selected_tender["base_value"]
+        new_base = old_base * (1 + drift_pct / 100)
+
+        updated = record_escalation(selected_tender["tender_id"], check_month, new_cpi, new_base)
+
+        st.session_state["last_result"] = {
+            "banner": f"Annual escalation recorded for '{updated['tender_id']}'. "
+                      f"New anchor: {check_month} @ CPI {new_cpi}. Registry updated.",
+            "tender_id": updated["tender_id"], "tender_name": updated["tender_name"],
+            "baseline_type": updated["baseline_type"],
+            "base_value": new_base,  # the document reflects the NEW base going forward
+            "start_date_str": updated["start_date"], "end_date_str": updated["end_date"],
+            "timeline_results": timeline_results, "stage_results": stage_results,
+            "extras": extras, "output_hash": output_hash,
+            "document_title": "Annual Contract Price Adjustment Record",
+            "escalation_info": {"effective_date": check_month, "old_base_zar": old_base, "new_base_zar": new_base},
         }
     except ValueError as e:
         st.error(f"Validation Pipeline Halted: {e}")
@@ -274,4 +375,6 @@ if "last_result" in st.session_state:
         res["tender_id"], res["tender_name"], res["baseline_type"], res["base_value"],
         res["start_date_str"], res["end_date_str"], res["timeline_results"],
         res["stage_results"], res["extras"], res["output_hash"],
+        document_title=res.get("document_title", "Audit-Ready Compliance Record"),
+        escalation_info=res.get("escalation_info"),
     )

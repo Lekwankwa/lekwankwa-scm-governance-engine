@@ -33,9 +33,11 @@ Design notes
 - The listing page is scraped for the current release tag (YYYYMM) instead
   of hardcoding a month, so this keeps working as Stats SA publishes new
   releases without code changes.
-- The archive this writes is a POINT-IN-TIME CSV: each run replaces the
-  trailing window, it never mutates a historical month's value in place —
-  consistent with core/validator.py Stage 1a (Bitemporal Core / PIT).
+- Each run OVERWRITES data/stats_sa_cpi_archive.csv with a fresh trailing
+  window: it does not diff against the previous file or retain a version
+  history, so nothing here currently proves a given month's value stayed
+  unchanged between runs -- don't describe this as point-in-time/bitemporal
+  behavior until it actually keeps that history and can demonstrate it.
 - This intentionally does NOT run validator.py itself. Run
   `python core/validator.py` (or the Streamlit app) afterwards to gate the
   freshly ingested file through the 10-stage pipeline before trusting it.
