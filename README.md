@@ -39,7 +39,7 @@ Lekwankwa SCM Governance Engine/
 │
 ├── utils/
 │   ├── __init__.py
-│   └── document_gen.py              # FPDF2 automated report generator (placeholder)
+│   └── document_gen.py              # FPDF2 automated report generator — builds the real Audit-Ready PDF
 │
 ├── app.py                           # Main Streamlit user interface entry point
 ├── requirements.txt                 # Application runtime dependencies

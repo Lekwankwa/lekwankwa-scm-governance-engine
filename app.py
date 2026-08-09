@@ -4,6 +4,7 @@ import json
 import streamlit as st
 
 from core.validator import SCMDataValidator
+from utils.document_gen import build_audit_pdf
 
 # Set up clean, institutional dark theme dashboard configuration
 st.set_page_config(page_title="Lekwankwa SCM Engine", layout="wide")
@@ -91,16 +92,20 @@ if trigger_calculation:
                 st.subheader("📦 Automated Output Package Registry")
                 st.write("Download certified compliance payloads directly below:")
 
-                # Format JSON Payload string
+                # Shared tender metadata — both the PDF and the JSON export are
+                # built from this same dict + output_hash, so the two files are
+                # cryptographically tied to the same run (see document_gen.py).
+                tender_metadata = {
+                    "id": tender_id,
+                    "name": tender_name,
+                    "type": baseline_type,
+                    "base_zar": base_value,
+                    "start": str(start_date),
+                    "end": str(end_date),
+                }
+
                 gold_standard_json = {
-                    "tender_metadata": {
-                        "id": tender_id,
-                        "name": tender_name,
-                        "type": baseline_type,
-                        "base_zar": base_value,
-                        "start": str(start_date),
-                        "end": str(end_date),
-                    },
+                    "tender_metadata": tender_metadata,
                     "validation_pipeline": stage_results,
                     "lineage": extras.get("lineage", {}),
                     "outliers": extras.get("outliers", []),
@@ -109,11 +114,20 @@ if trigger_calculation:
                 }
                 json_bytes = json.dumps(gold_standard_json, indent=4, default=str).encode("utf-8")
 
+                pdf_bytes = build_audit_pdf(
+                    tender_metadata=tender_metadata,
+                    stage_results=stage_results,
+                    timeline_results=timeline_results,
+                    lineage=extras.get("lineage", {}),
+                    outliers=extras.get("outliers", []),
+                    output_hash=output_hash,
+                )
+
                 out_col1, out_col2 = st.columns(2)
                 with out_col1:
                     st.download_button(
                         label="📥 Download Audit-Ready PDF Record",
-                        data=b"Simulated PDF Binary Stream Data for Demo Presentation",
+                        data=pdf_bytes,
                         file_name=f"Audit_Record_{tender_id}.pdf",
                         mime="application/pdf",
                     )
