@@ -112,6 +112,7 @@ The sidebar's "Mode" selector splits the app into the two moments a real SCM aud
 
 - **Anchor New Tender** (Product 1, Inception Gateway) — enter tender metadata once, pick the execution/start date, and (for an annual-baseline tender) the CPA formula type — see below. Clicking **Anchor Tender** runs that month through the full 10-stage gate and writes the whole record to `data/tenders.json` via `core/tender_registry.py`. Re-anchoring an existing `tender_id` is refused — use the other mode to check it instead.
 - **Open Existing Tender** (Product 2/3, recurring audits) — pick a previously anchored tender from the registry (no metadata re-entry) and a check month from the CPI archive; the check-month picker shows every month on/after the tender's current anchor for both baseline types, labeling and defaulting to true 12-month anniversaries. **Run Monthly Check** is a non-mutating preview against whatever is currently in effect, gated by the full 10-stage pipeline.
+- **Correct Prior Escalation** — an *approved* annual price is never edited in place. This mode layers a new, separately dated correction on top of a chosen year's already-approved escalation — see below.
 
 ### Permanent original vs. rolling current (`core/tender_registry.py`)
 
@@ -140,4 +141,17 @@ Reaching an anniversary month never changes anything by itself:
 
 Both the pending preview and the applied PDF/JSON always show the full chain: the original baseline (unchanged), the prior year's adjusted price (for a compounding tender), this year's new adjusted price, and which formula produced it — so an auditor can trace current price back to the original tender submission in one document.
 
-All outputs — anchor, monthly check, and applied escalation — render through the same result panel and produce the same certified PDF/JSON export pair, keyed to whichever action most recently succeeded, with a `document_title` that names what actually happened ("Tender Anchor Record" / "Monthly Invoice Verification Record" / "Annual Contract Price Adjustment Record").
+All outputs — anchor, monthly check, and applied escalation — render through the same result panel and produce the same certified PDF/JSON export pair, keyed to whichever action most recently succeeded, with a `document_title` that names what actually happened ("Tender Anchor Record" / "Monthly Invoice Verification Record" / "Annual Contract Price Adjustment Record" / "Annual Price Correction Record").
+
+### Corrections are layered, never in-place edits (`apply_correction()` in `core/tender_registry.py`)
+
+An approved annual figure is permanent the moment it's applied — `apply_correction()` never rewrites `new_adjusted_price` on an `escalation_history` entry. A correction always **appends** to that entry's own `corrections` list (recording which year, the figure it replaces, the new figure, a required free-text reason, who approved the correction, and when), so `get_effective_escalation_price()` — the latest correction's figure, or the original if none — is what every later calculation reads, while the original approved figure stays in the record forever.
+
+For a `COMPOUND_FROM_PRIOR_YEAR` tender with already-approved years after the one being corrected, the approver must explicitly choose:
+
+- **ISOLATED** (default) — only the corrected year changes. Every later year keeps its own originally-approved figure untouched, but gets a non-destructive `stale_input_flags` note recording that it was calculated from a figure later corrected.
+- **CASCADE_FORWARD** — every later year also gets its own auto-generated correction layered on (same non-destructive rule — nothing is overwritten), recomputed by re-applying each step's *original* recorded CPI drift ratio to the corrected price chain. No archive re-query is needed: a price correction never changes what CPI a given month actually had.
+
+For `CUMULATIVE_FROM_ORIGINAL` tenders, or when correcting the latest/only year, this choice doesn't apply — later years (if any) were never calculated from this year's output, so nothing else changes.
+
+Corrections go through the same calculate-then-approve gate as an escalation ("Preview Correction" computes a dry run with no registry write; "Confirm & Apply Correction" requires a named approver and re-derives everything fresh rather than trusting the stashed preview). Once any correction exists for a tender, `get_correction_history()`'s full flattened trail — every correction and every stale-input flag, chronologically — is shown on **every** document generated for that tender from then on, not just the correction's own record.

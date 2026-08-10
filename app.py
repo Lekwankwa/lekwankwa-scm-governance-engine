@@ -5,7 +5,10 @@ import pandas as pd
 import streamlit as st
 
 from core.validator import SCMDataValidator
-from core.tender_registry import get_tender, list_tenders, record_escalation, save_tender, tender_exists
+from core.tender_registry import (
+    apply_correction, get_correction_history, get_effective_escalation_price,
+    get_tender, list_tenders, record_escalation, save_tender, tender_exists,
+)
 from utils.document_gen import build_audit_pdf
 
 ARCHIVE_PATH = "data/stats_sa_cpi_archive.csv"
@@ -49,24 +52,34 @@ def _month_label(month: str, anchor_month: str, anniversary_months: set) -> str:
 
 
 def render_result_block(tender_id, tender_name, baseline_type, base_value,
-                          start_date_str, end_date_str, timeline_results,
-                          stage_results, extras, output_hash,
+                          start_date_str, end_date_str, timeline_results=None,
+                          stage_results=None, extras=None, output_hash="N/A",
                           document_title="Audit-Ready Compliance Record",
-                          escalation_info=None):
+                          escalation_info=None, correction_detail=None,
+                          correction_history=None):
     """Shared output rendering for the anchor event and every later
-    monthly/annual check -- metrics, the real 10-stage panel, the results
-    table, and the PDF/JSON downloads. Used identically by "Anchor New
-    Tender" and "Open Existing Tender" so a check never needs its own
-    separate rendering path.
+    monthly/annual check/escalation/correction -- metrics, the real
+    10-stage panel, the results table, and the PDF/JSON downloads. Used
+    identically everywhere so no action needs its own separate rendering
+    path.
 
-    document_title / escalation_info: different purpose, different legal
-    weight, different downstream effect on the contract -- see
-    utils/document_gen.py's build_audit_pdf() docstring for the full
-    explanation. escalation_info, when set, is a dict with effective_date,
-    old_base_zar, new_base_zar for a formal Annual Escalation.
+    document_title / escalation_info / correction_detail: different
+    purpose, different legal weight, different downstream effect on the
+    contract -- see utils/document_gen.py's build_audit_pdf() docstring
+    for the full explanation.
+
+    timeline_results/stage_results are None for a pure correction record
+    (a correction is a business/audit action, not a new CPI calculation --
+    nothing runs the 10-stage gate for one) -- the metrics/stage-panel/
+    lineage-table sections are skipped gracefully in that case.
+
+    correction_history, when non-empty, is shown on EVERY result for a
+    tender that has ever had a correction applied -- not just the
+    correction's own record -- per the "never just the final number with
+    no trace of what changed" requirement.
     """
-    inception_data = timeline_results[0]
-    latest_data = timeline_results[-1]
+    extras = extras or {}
+    correction_history = correction_history or []
 
     if escalation_info:
         approval_line = ""
@@ -103,42 +116,72 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         )
         st.info("\n\n".join(derivation_lines))
 
-    # METRIC DISPLAY MATRIX (Top Layer Visualization)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Anchor CPI", f"{inception_data['anchor_cpi']} ({inception_data.get('anchor_month', inception_data['month'])})")
-    with col2:
-        st.metric("Current Vintage CPI", f"{latest_data['current_cpi']} ({latest_data['month']})")
-    with col3:
-        final_drift = latest_data["drift_percentage"]
-        st.metric("Cumulative Drift %", f"{final_drift:+.4f}%")
+    if correction_detail:
+        cd = correction_detail
+        cascade_line = f" Cascade mode: {cd['cascade_mode']}." if cd.get("cascade_mode") else ""
+        st.error(
+            f"This is a formal correction to the approved {cd['year_month']} annual escalation "
+            f"record. The figure is revised from R{cd['original_figure']:,.2f} to "
+            f"R{cd['corrected_figure']:,.2f}. Reason: {cd['reason']}. Approved by "
+            f"{cd['corrected_by']} on {cd.get('corrected_at', 'N/A')}.{cascade_line}"
+        )
 
-    st.markdown("---")
+    # METRIC DISPLAY MATRIX (Top Layer Visualization) -- only for a
+    # CPI-driven record (anchor / monthly check / escalation); a pure
+    # correction record has no CPI calculation to show metrics for.
+    if timeline_results:
+        inception_data = timeline_results[0]
+        latest_data = timeline_results[-1]
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Anchor CPI", f"{inception_data['anchor_cpi']} ({inception_data.get('anchor_month', inception_data['month'])})")
+        with col2:
+            st.metric("Current Vintage CPI", f"{latest_data['current_cpi']} ({latest_data['month']})")
+        with col3:
+            final_drift = latest_data["drift_percentage"]
+            st.metric("Cumulative Drift %", f"{final_drift:+.4f}%")
+        st.markdown("---")
 
     # 10-STAGE AUTOMATED PIPELINE VISUALIZATION
     # Renders the REAL stage-by-stage results returned by the validator
     # (same 10-stage pattern used across the Lekwankwa data platform:
     # 1a / 1b / 1c / 2 / 3 / 4 / 5 / 6 / 7 / 8), not a static checklist.
-    overall_ok = all(s["status"] != "FAIL" for s in stage_results)
-    if overall_ok:
-        st.success("10-Stage Data Integrity Validation Pipeline Status: [PASSED]")
-    else:
-        st.error("10-Stage Data Integrity Validation Pipeline Status: [FAILED]")
+    # Skipped for a pure correction record -- nothing runs the gate for one.
+    if stage_results:
+        overall_ok = all(s["status"] != "FAIL" for s in stage_results)
+        if overall_ok:
+            st.success("10-Stage Data Integrity Validation Pipeline Status: [PASSED]")
+        else:
+            st.error("10-Stage Data Integrity Validation Pipeline Status: [FAILED]")
 
-    # Same bracketed [PASS]/[WARN]/[FAIL] convention used in the PDF export,
-    # so the on-screen and PDF status language match.
-    cols = st.columns(5)
-    for i, s in enumerate(stage_results):
-        cols[i % 5].markdown(f"**[{s['status']}] Stage {s['stage']} - {s['name']}**")
-        with cols[i % 5].expander("detail", expanded=False):
-            st.caption(s["detail"])
+        # Same bracketed [PASS]/[WARN]/[FAIL] convention used in the PDF export,
+        # so the on-screen and PDF status language match.
+        cols = st.columns(5)
+        for i, s in enumerate(stage_results):
+            cols[i % 5].markdown(f"**[{s['status']}] Stage {s['stage']} - {s['name']}**")
+            with cols[i % 5].expander("detail", expanded=False):
+                st.caption(s["detail"])
+        st.markdown("---")
 
-    st.markdown("---")
+    if timeline_results:
+        st.subheader("Audit Lineage")
+        st.dataframe(pd.DataFrame(timeline_results), use_container_width=True)
+        st.markdown("---")
 
-    st.subheader("Audit Lineage")
-    st.dataframe(pd.DataFrame(timeline_results), use_container_width=True)
-
-    st.markdown("---")
+    if correction_history:
+        st.subheader("Correction History")
+        st.caption("Shown on every document for this tender, per the requirement that a correction "
+                    "is never a silent edit -- the full trail stays visible going forward.")
+        for c in correction_history:
+            if c["type"] == "CORRECTION":
+                cascade_tag = f" ({c['cascade_mode']})" if c.get("cascade_mode") else ""
+                st.markdown(f"**{c['year_month']} — Correction{cascade_tag}**")
+                st.caption(f"Original: R{c['original_figure']:,.2f} -> Corrected: R{c['corrected_figure']:,.2f} | "
+                            f"Reason: {c['reason']} | Approved by: {c['corrected_by']} on {c['corrected_at']}")
+            else:
+                st.markdown(f"**{c['year_month']} — Stale Input Flag**")
+                st.caption(c["note"])
+        st.markdown("---")
 
     # OUTPUT GENERATION INTERFACE
     st.subheader("Automated Output Package Registry")
@@ -159,12 +202,14 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
     gold_standard_json = {
         "record_type": document_title,
         "tender_metadata": tender_metadata,
-        "validation_pipeline": stage_results,
+        "validation_pipeline": stage_results or [],
         "lineage": extras.get("lineage", {}),
         "outliers": extras.get("outliers", []),
         "output_hash": output_hash,
-        "audit_lineage": timeline_results,
+        "audit_lineage": timeline_results or [],
         "escalation": escalation_info,
+        "correction": correction_detail,
+        "correction_history": correction_history,
     }
     json_bytes = json.dumps(gold_standard_json, indent=4, default=str).encode("utf-8")
 
@@ -176,22 +221,30 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         outliers=extras.get("outliers", []),
         document_title=document_title,
         escalation_info=escalation_info,
+        correction_detail=correction_detail,
+        correction_history=correction_history,
         output_hash=output_hash,
     )
 
+    # A pure correction record has no CPI timeline to pull a month tag from
+    # for the file name -- fall back to the corrected year, then a plain tag.
+    file_month_tag = (
+        timeline_results[-1]["month"] if timeline_results
+        else (correction_detail["year_month"] if correction_detail else "record")
+    )
     out_col1, out_col2 = st.columns(2)
     with out_col1:
         st.download_button(
             label="Download Audit-Ready PDF Record",
             data=pdf_bytes,
-            file_name=f"Audit_Record_{tender_id}_{latest_data['month']}.pdf",
+            file_name=f"Audit_Record_{tender_id}_{file_month_tag}.pdf",
             mime="application/pdf",
         )
     with out_col2:
         st.download_button(
             label="Export Gold Standard ERP Payload (.json)",
             data=json_bytes,
-            file_name=f"ERP_Payload_{tender_id}_{latest_data['month']}.json",
+            file_name=f"ERP_Payload_{tender_id}_{file_month_tag}.json",
             mime="application/json",
         )
 
@@ -199,15 +252,21 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
 # TENDER REGISTRY (Sidebar UI)
 with st.sidebar:
     st.header("Tender Registry")
-    registry_mode = st.radio("Mode", ["Anchor New Tender", "Open Existing Tender"])
+    registry_mode = st.radio("Mode", ["Anchor New Tender", "Open Existing Tender", "Correct Prior Escalation"])
     st.markdown("---")
 
     trigger_anchor = False
     trigger_check = False
     trigger_calculate_escalation = False
+    trigger_preview_correction = False
     selected_tender = None
     check_month = None
     check_month_is_anniversary = False
+    correction_tender = None
+    correction_year_month = None
+    correction_figure = None
+    correction_reason = None
+    correction_cascade_mode = "ISOLATED"
 
     if registry_mode == "Anchor New Tender":
         st.header("Tender Configuration Panel")
@@ -245,7 +304,7 @@ with st.sidebar:
         st.markdown("---")
         trigger_anchor = st.button("Anchor Tender")
 
-    else:
+    elif registry_mode == "Open Existing Tender":
         st.header("Open Existing Tender")
         tenders = list_tenders()
         if not tenders:
@@ -296,6 +355,63 @@ with st.sidebar:
                 else:
                     trigger_check = st.button("Run Monthly Check")
 
+    else:  # registry_mode == "Correct Prior Escalation"
+        st.header("Correct Prior Escalation")
+        st.write("An approved annual price is never edited in place. This layers a new, "
+                  "separately dated correction on top -- the original approved figure is kept forever.")
+        correctable = [t for t in list_tenders() if t.get("escalation_history")]
+        if not correctable:
+            st.info("No tenders have any approved Annual Escalation yet to correct.")
+        else:
+            options = {f"{t['tender_id']} - {t['tender_name']}": t["tender_id"] for t in correctable}
+            picked_label = st.selectbox("Select Tender", list(options.keys()), key="correction_tender_select")
+            correction_tender = get_tender(options[picked_label])
+            history = correction_tender["escalation_history"]
+            year_options = [e["new_anchor_month"] for e in history]
+
+            def _correction_year_label(ym, _history=history):
+                entry = next(e for e in _history if e["new_anchor_month"] == ym)
+                eff = get_effective_escalation_price(entry)
+                tag = " [already corrected]" if entry.get("corrections") else ""
+                return f"{ym} -- current effective price R{eff:,.2f}{tag}"
+
+            correction_year_month = st.selectbox(
+                "Select Year to Correct", year_options, index=len(year_options) - 1,
+                format_func=_correction_year_label,
+            )
+            entry = next(e for e in history if e["new_anchor_month"] == correction_year_month)
+            current_effective = get_effective_escalation_price(entry)
+            st.caption(f"Currently effective figure for {correction_year_month}: R{current_effective:,.2f} "
+                        f"(originally approved: R{entry['new_adjusted_price']:,.2f})")
+
+            correction_figure = st.number_input(
+                "Corrected Figure (ZAR)", min_value=0.01, value=float(current_effective), step=1000.0
+            )
+            correction_reason = st.text_area(
+                "Reason for Correction (required)",
+                placeholder="e.g. data entry error, dispute resolution, audit finding",
+            )
+
+            idx = year_options.index(correction_year_month)
+            has_later_years = idx < len(year_options) - 1
+            is_compound_tender = correction_tender.get("cpa_formula_type") == "COMPOUND_FROM_PRIOR_YEAR"
+            if has_later_years and is_compound_tender:
+                correction_cascade_mode = st.radio(
+                    "How should subsequent already-approved years be handled?",
+                    ["ISOLATED", "CASCADE_FORWARD"],
+                    format_func=lambda x: {
+                        "ISOLATED": "Remain ISOLATED (default) -- only this year changes; later years "
+                                     "stay as approved, flagged as calculated from a since-corrected figure",
+                        "CASCADE_FORWARD": "Cascade Forward -- recalculate every subsequent approved year "
+                                            "from this correction",
+                    }[x],
+                )
+            else:
+                correction_cascade_mode = "ISOLATED"  # not applicable: CUMULATIVE, or no later years exist
+
+            st.markdown("---")
+            trigger_preview_correction = st.button("Preview Correction")
+
 # MAIN FRAME PROCESSING GRAPHICS
 if trigger_anchor:
     if start_date >= end_date:
@@ -345,6 +461,7 @@ if trigger_anchor:
                 "timeline_results": timeline_results, "stage_results": stage_results,
                 "extras": extras, "output_hash": output_hash,
                 "document_title": "Tender Anchor Record", "escalation_info": None,
+                "correction_detail": None, "correction_history": [],  # brand new tender, none possible yet
             }
         except ValueError as e:
             st.error(f"Validation Pipeline Halted: {e}")
@@ -371,6 +488,10 @@ elif trigger_check and selected_tender and check_month:
             "timeline_results": timeline_results, "stage_results": stage_results,
             "extras": extras, "output_hash": output_hash,
             "document_title": "Monthly Invoice Verification Record", "escalation_info": None,
+            "correction_detail": None,
+            # Every document for a tender that has ever been corrected shows
+            # the full trail, not just the correction's own record.
+            "correction_history": get_correction_history(selected_tender),
         }
     except ValueError as e:
         st.error(f"Validation Pipeline Halted: {e}")
@@ -576,6 +697,8 @@ if "pending_escalation" in st.session_state:
                         "prior_anchor_month": pend["prior_anchor_month"],
                         "prior_adjusted_price": pend["prior_adjusted_price"],
                     },
+                    "correction_detail": None,
+                    "correction_history": get_correction_history(updated),
                 }
                 del st.session_state["pending_escalation"]
                 st.rerun()
@@ -584,10 +707,138 @@ if "pending_escalation" in st.session_state:
             except Exception as e:
                 st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
 
-# Renders whatever the most recent successful anchor/check/APPLIED escalation
-# produced. Lives outside the trigger blocks above so it survives the
-# reruns that clicking either download button inside it causes (see
-# comment above).
+elif trigger_preview_correction and correction_tender and correction_year_month:
+    # PREVIEW ONLY -- a dry_run, so nothing is written to the registry.
+    # An approved figure is never edited in place; this just computes what
+    # WOULD change (including any cascade impact) for review before an
+    # approver commits to it below.
+    try:
+        preview = apply_correction(
+            correction_tender["tender_id"], correction_year_month, correction_figure,
+            correction_reason or "", corrected_by=None, cascade_mode=correction_cascade_mode,
+            dry_run=True,
+        )
+        st.session_state["pending_correction"] = {
+            "tender_id": correction_tender["tender_id"],
+            "tender_name": correction_tender["tender_name"],
+            "baseline_type": correction_tender["baseline_type"],
+            "start_date": correction_tender["start_date"],
+            "end_date": correction_tender["end_date"],
+            "cpa_formula_type": correction_tender.get("cpa_formula_type"),
+            "year_month": correction_year_month,
+            "corrected_figure": correction_figure,
+            "reason": correction_reason,
+            "cascade_mode": correction_cascade_mode,
+            "preview_escalation_history": preview["escalation_history"],
+            "preview_current_adjusted_price": preview["current_adjusted_price"],
+            "calculated_at": datetime.datetime.now().isoformat(),
+        }
+    except ValueError as e:
+        st.error(f"Correction Rejected: {e}")
+
+# PENDING CORRECTION -- APPROVAL GATE
+# Same pattern as the escalation gate above: nothing is applied to the
+# registry until an approver is named and Confirm & Apply is clicked.
+if "pending_correction" in st.session_state:
+    pc = st.session_state["pending_correction"]
+    year_idx = next(i for i, e in enumerate(pc["preview_escalation_history"]) if e["new_anchor_month"] == pc["year_month"])
+    corrected_entry = pc["preview_escalation_history"][year_idx]
+    # apply_correction() already computed this (the effective price right
+    # before the new correction it appended in the dry-run preview) -- read
+    # it straight from there instead of re-deriving it a second way.
+    original_figure = corrected_entry["corrections"][-1]["original_figure"]
+    is_compound = pc["cpa_formula_type"] == "COMPOUND_FROM_PRIOR_YEAR"
+    later_entries = pc["preview_escalation_history"][year_idx + 1:]
+
+    lines = [
+        f"PENDING CORRECTION for '{pc['tender_id']}', Year {pc['year_month']} -- PROPOSED, NOT YET APPLIED.",
+        "",
+        f"Original Approved Figure: R{original_figure:,.2f}",
+        f"Proposed Corrected Figure: R{pc['corrected_figure']:,.2f}",
+        f"Reason: {pc['reason']}",
+    ]
+    if later_entries and is_compound:
+        lines.append(f"Cascade Mode: {pc['cascade_mode']}")
+    if later_entries:
+        lines.append("")
+        lines.append("Impact on subsequent already-approved years:")
+        for later in later_entries:
+            eff = get_effective_escalation_price(later)
+            if pc["cascade_mode"] == "CASCADE_FORWARD" and is_compound:
+                lines.append(f"  {later['new_anchor_month']}: would be RECALCULATED to R{eff:,.2f}")
+            else:
+                lines.append(f"  {later['new_anchor_month']}: stays as approved at "
+                              f"R{later['new_adjusted_price']:,.2f} (will be flagged as calculated "
+                              "from a since-corrected input)")
+    lines += [
+        "",
+        f"New current effective price after this correction: R{pc['preview_current_adjusted_price']:,.2f}",
+    ]
+    st.markdown("---")
+    st.warning("\n\n".join(lines))
+
+    corrector_name = st.text_input(
+        "Approver Name / Role (required to apply)", key="corrector_input",
+        placeholder="e.g. J. Naidoo, SCM Manager",
+    )
+    confirm_corr_col, discard_corr_col = st.columns(2)
+    with confirm_corr_col:
+        confirm_correction_clicked = st.button("Confirm & Apply Correction")
+    with discard_corr_col:
+        discard_correction_clicked = st.button("Discard Pending Correction")
+
+    if discard_correction_clicked:
+        del st.session_state["pending_correction"]
+        st.rerun()
+
+    if confirm_correction_clicked:
+        if not corrector_name or not corrector_name.strip():
+            st.error("Approver Name / Role is required before a correction can be applied.")
+        else:
+            try:
+                updated = apply_correction(
+                    pc["tender_id"], pc["year_month"], pc["corrected_figure"], pc["reason"],
+                    corrected_by=corrector_name.strip(), cascade_mode=pc["cascade_mode"],
+                )
+                # Re-find the entry by year_month rather than reusing the
+                # preview's index -- cheap, and avoids ever trusting an
+                # index computed against a possibly-stale snapshot.
+                updated_entry = next(e for e in updated["escalation_history"] if e["new_anchor_month"] == pc["year_month"])
+                corrected_at = updated_entry["corrections"][-1]["corrected_at"]
+
+                st.session_state["last_result"] = {
+                    "banner": f"Correction APPLIED for '{updated['tender_id']}', {pc['year_month']}. "
+                              f"Approved by {corrector_name.strip()}.",
+                    "tender_id": updated["tender_id"], "tender_name": updated["tender_name"],
+                    "baseline_type": updated["baseline_type"],
+                    "base_value": updated["current_adjusted_price"],
+                    "start_date_str": updated["start_date"], "end_date_str": updated["end_date"],
+                    "timeline_results": None, "stage_results": None,  # a correction is not a CPI calculation
+                    "extras": {}, "output_hash": "N/A",
+                    "document_title": "Annual Price Correction Record",
+                    "escalation_info": None,
+                    "correction_detail": {
+                        "year_month": pc["year_month"],
+                        "original_figure": original_figure,
+                        "corrected_figure": pc["corrected_figure"],
+                        "reason": pc["reason"],
+                        "corrected_by": corrector_name.strip(),
+                        "corrected_at": corrected_at,
+                        "cascade_mode": pc["cascade_mode"] if is_compound and later_entries else None,
+                    },
+                    "correction_history": get_correction_history(updated),
+                }
+                del st.session_state["pending_correction"]
+                st.rerun()
+            except ValueError as e:
+                st.error(f"Validation Pipeline Halted: {e}")
+            except Exception as e:
+                st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
+
+# Renders whatever the most recent successful anchor/check/escalation/
+# correction produced. Lives outside the trigger blocks above so it
+# survives the reruns that clicking either download button inside it
+# causes (see comment above).
 if "last_result" in st.session_state:
     res = st.session_state["last_result"]
     if res["banner"]:
@@ -598,4 +849,6 @@ if "last_result" in st.session_state:
         res["stage_results"], res["extras"], res["output_hash"],
         document_title=res.get("document_title", "Audit-Ready Compliance Record"),
         escalation_info=res.get("escalation_info"),
+        correction_detail=res.get("correction_detail"),
+        correction_history=res.get("correction_history"),
     )

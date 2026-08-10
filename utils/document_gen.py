@@ -104,19 +104,22 @@ def _kv_table(pdf: FPDF, rows: list[tuple[str, str]], label_width: float = 75):
 
 def build_audit_pdf(
     tender_metadata: dict,
-    stage_results: list,
-    timeline_results: list,
+    stage_results: list = None,
+    timeline_results: list = None,
     lineage: dict = None,
     outliers: list = None,
     output_hash: str = "N/A",
     document_title: str = "Audit-Ready Compliance Record",
     escalation_info: dict = None,
+    correction_detail: dict = None,
+    correction_history: list = None,
 ) -> bytes:
     """
     document_title distinguishes what kind of record this is -- different
     purpose, different legal weight, different downstream effect on the
     contract -- e.g. "Tender Anchor Record", "Monthly Invoice Verification
-    Record", or "Annual Contract Price Adjustment Record".
+    Record", "Annual Contract Price Adjustment Record", or "Annual Price
+    Correction Record".
 
     escalation_info, when set, is a dict with effective_date, old_base_zar,
     new_base_zar, and (once approved) approved_by/approved_at: a formal
@@ -124,9 +127,31 @@ def build_audit_pdf(
     that gets its own explicit notice section up front rather than being
     buried in the metadata table -- and per the approval-gated workflow,
     every applied escalation must show who approved it and when.
+
+    stage_results / timeline_results are optional: a correction record
+    (see correction_detail below) is a pure business/audit action, not a
+    CPI-driven calculation -- no 10-stage gate runs for one -- so sections
+    2 and 3 are skipped gracefully when these are empty, rather than
+    showing a misleading "0 stages ran" block. Section numbers renumber
+    themselves to match whichever sections actually render.
+
+    correction_detail, when set, is a dict with year_month, original_figure,
+    corrected_figure, reason, corrected_by, corrected_at, and cascade_mode
+    (None for a non-compound tender or when correcting the latest year) --
+    an approved figure is never edited in place, so a correction gets its
+    own explicit notice, just like escalation_info.
+
+    correction_history, when non-empty, is the tender's FULL correction
+    history (core/tender_registry.py's get_correction_history()) -- passed
+    to EVERY document generated for a tender that has ever been corrected,
+    not just the correction's own record, so nobody reading e.g. a routine
+    monthly check ever sees a final number with no trace of what changed.
     """
     lineage = lineage or {}
     outliers = outliers or []
+    stage_results = stage_results or []
+    timeline_results = timeline_results or []
+    correction_history = correction_history or []
 
     pdf = AuditPDF()
     pdf.document_title = document_title
@@ -179,8 +204,31 @@ def build_audit_pdf(
         _kv_table(pdf, derivation_rows, label_width=65)
         pdf.ln(2)
 
-    # ── Tender metadata ──────────────────────────────────────────────────
-    _section_title(pdf, "1. Tender Metadata")
+    if correction_detail:
+        cd = correction_detail
+        pdf.set_draw_color(*ACCENT)
+        pdf.set_fill_color(255, 228, 228)
+        pdf.set_font("Helvetica", "B", 10.5)
+        pdf.set_text_color(0, 0, 0)
+        cascade_line = f" Cascade mode: {cd['cascade_mode']}." if cd.get("cascade_mode") else ""
+        notice = (
+            f"This is a formal correction to the approved {cd['year_month']} annual escalation "
+            f"record. The figure is revised from R{cd['original_figure']:,.2f} to "
+            f"R{cd['corrected_figure']:,.2f}. Reason: {cd['reason']}. Approved by "
+            f"{cd['corrected_by']} on {cd.get('corrected_at', 'N/A')}.{cascade_line}"
+        )
+        pdf.multi_cell(0, 7, _safe(notice), border=1, fill=True,
+                        new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(4)
+
+    # Sections number themselves as they render, since a correction record
+    # has no CPI/stage sections to show (see docstring) and a routine check
+    # has no correction-history section to show -- fixed numbers would
+    # either skip or collide.
+    section_num = 1
+
+    # ── Tender metadata (always) ─────────────────────────────────────────
+    _section_title(pdf, f"{section_num}. Tender Metadata")
     _kv_table(pdf, [
         ("Tender ID", tender_metadata.get("id", "")),
         ("Tender Name", tender_metadata.get("name", "")),
@@ -190,10 +238,11 @@ def build_audit_pdf(
         ("Contract End", tender_metadata.get("end", "")),
         ("Report Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     ])
+    section_num += 1
 
-    # ── CPI drift summary ────────────────────────────────────────────────
-    _section_title(pdf, "2. CPI Drift & Payout Calculation")
+    # ── CPI drift summary (only for a CPI-driven record) ─────────────────
     if timeline_results:
+        _section_title(pdf, f"{section_num}. CPI Drift & Payout Calculation")
         anchor = timeline_results[0]
         latest = timeline_results[-1]
         base_zar = float(tender_metadata.get("base_zar", 0))
@@ -205,55 +254,83 @@ def build_audit_pdf(
             ("Cumulative Drift %", f"{drift_pct:+.4f}%"),
             ("Approved Maximum Payout (ZAR)", f"{approved_max_payout:,.2f}"),
         ])
-    else:
-        pdf.set_font("Helvetica", "I", 10)
-        pdf.cell(0, 7, _safe("No timeline records were processed for this run."),
-                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        section_num += 1
 
-    # ── 10-stage validation pipeline ─────────────────────────────────────
+    # ── 10-stage validation pipeline (only when a gate actually ran) ─────
     # Rendered as one block per stage (not a fixed-height grid) so a long
     # detail string — e.g. a Stage 1c DATA_GAP listing many missing months —
     # can wrap to multiple lines without misaligning neighbouring cells.
-    _section_title(pdf, "3. 10-Stage Data Integrity Validation Pipeline")
-    for s in stage_results:
-        color = STATUS_COLOR.get(s["status"], (0, 0, 0))
-        detail = s.get("detail", "")
-        if len(detail) > 300:
-            detail = detail[:297] + "..."
+    if stage_results:
+        _section_title(pdf, f"{section_num}. 10-Stage Data Integrity Validation Pipeline")
+        for s in stage_results:
+            color = STATUS_COLOR.get(s["status"], (0, 0, 0))
+            detail = s.get("detail", "")
+            if len(detail) > 300:
+                detail = detail[:297] + "..."
 
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(150, 6.5, _safe(f"Stage {s['stage']} - {s['name']}"), new_x=XPos.RIGHT, new_y=YPos.TOP)
+            pdf.set_text_color(*color)
+            pdf.cell(40, 6.5, _safe(f"[{s['status']}]"), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+            pdf.set_text_color(70, 70, 70)
+            pdf.set_font("Helvetica", "", 8.5)
+            pdf.multi_cell(0, 5, _safe(detail), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(1)
+
+        overall_ok = all(s["status"] != "FAIL" for s in stage_results)
+        pdf.ln(3)
         pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(*(STATUS_COLOR["PASS"] if overall_ok else STATUS_COLOR["FAIL"]))
+        pdf.cell(0, 7, _safe(f"Overall Pipeline Status: {'PASSED' if overall_ok else 'FAILED'}"),
+                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_text_color(0, 0, 0)
-        pdf.cell(150, 6.5, _safe(f"Stage {s['stage']} - {s['name']}"), new_x=XPos.RIGHT, new_y=YPos.TOP)
-        pdf.set_text_color(*color)
-        pdf.cell(40, 6.5, _safe(f"[{s['status']}]"), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
-        pdf.set_text_color(70, 70, 70)
-        pdf.set_font("Helvetica", "", 8.5)
-        pdf.multi_cell(0, 5, _safe(detail), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_text_color(0, 0, 0)
-        pdf.ln(1)
+        section_num += 1
 
-    overall_ok = all(s["status"] != "FAIL" for s in stage_results)
-    pdf.ln(3)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_text_color(*(STATUS_COLOR["PASS"] if overall_ok else STATUS_COLOR["FAIL"]))
-    pdf.cell(0, 7, _safe(f"Overall Pipeline Status: {'PASSED' if overall_ok else 'FAILED'}"),
-              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_text_color(0, 0, 0)
-
-    # ── Lineage & outliers ───────────────────────────────────────────────
-    _section_title(pdf, "4. Lineage & Provenance")
-    _kv_table(pdf, [
-        ("Source File", lineage.get("source_file", "N/A")),
-        ("Last Modified", lineage.get("last_modified", "N/A")),
-        ("Row Count", str(lineage.get("row_count", "N/A"))),
-    ])
+    # ── Lineage (only when a validator run produced any) ─────────────────
+    if lineage:
+        _section_title(pdf, f"{section_num}. Lineage & Provenance")
+        _kv_table(pdf, [
+            ("Source File", lineage.get("source_file", "N/A")),
+            ("Last Modified", lineage.get("last_modified", "N/A")),
+            ("Row Count", str(lineage.get("row_count", "N/A"))),
+        ])
+        section_num += 1
 
     if outliers:
-        _section_title(pdf, "5. Outlier Extraction")
+        _section_title(pdf, f"{section_num}. Outlier Extraction")
         pdf.set_font("Helvetica", "", 9)
         for o in outliers:
             pdf.cell(0, 6, _safe(f"  - {o.get('Date', '?')}: CPI_Value = {o.get('CPI_Value', '?')}"),
                       new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        section_num += 1
+
+    # ── Correction history (whenever this tender has ever been corrected,
+    # on EVERY document generated for it -- never just the final number
+    # with no trace of what changed) ──────────────────────────────────────
+    if correction_history:
+        _section_title(pdf, f"{section_num}. Correction History")
+        for c in correction_history:
+            pdf.set_font("Helvetica", "B", 9.5)
+            pdf.set_text_color(0, 0, 0)
+            if c["type"] == "CORRECTION":
+                cascade_tag = f" ({c['cascade_mode']})" if c.get("cascade_mode") else ""
+                header = f"{c['year_month']} -- Correction{cascade_tag}"
+                detail = (f"Original: R{c['original_figure']:,.2f}  ->  "
+                          f"Corrected: R{c['corrected_figure']:,.2f}  |  "
+                          f"Reason: {c['reason']}  |  "
+                          f"Approved by: {c['corrected_by']} on {c['corrected_at']}")
+            else:  # STALE_INPUT_FLAG
+                header = f"{c['year_month']} -- Stale Input Flag"
+                detail = c["note"]
+            pdf.cell(0, 6, _safe(header), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("Helvetica", "", 8.5)
+            pdf.set_text_color(70, 70, 70)
+            pdf.multi_cell(0, 5, _safe(detail), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(1)
+        section_num += 1
 
     # ── Audit integrity hash ─────────────────────────────────────────────
     pdf.ln(4)
