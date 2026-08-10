@@ -44,6 +44,31 @@ def _anniversary_months(anchor_month: str, available_months: list) -> list:
     return result
 
 
+def _formula_reference_point(tender: dict) -> tuple:
+    """(anchor_month, anchor_cpi, base_price) to use as the drift reference
+    for a tender, per its CPA formula type -- the single source of truth
+    used identically by "Run Monthly Check" AND "Calculate/Confirm Annual
+    Escalation", so a monthly preview is never inconsistent with what the
+    next escalation would actually compute for the same tender:
+
+      CUMULATIVE_FROM_ORIGINAL -- always the permanent original anchor/base,
+          regardless of how many escalations have happened since. A monthly
+          check is a live preview of "what would the next escalation compute
+          right now" -- it was a real bug for this to instead measure drift
+          from the CURRENT (rolled) anchor after an escalation, which would
+          silently double-count the prior escalation's effect.
+      COMPOUND_FROM_PRIOR_YEAR -- the current (rolled) anchor/price, i.e.
+          whatever the last approved escalation left in effect. This one
+          was already correct.
+
+    Before any escalation has happened, original_* and current_* are
+    identical, so this makes no difference either way.
+    """
+    if tender.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL") == "CUMULATIVE_FROM_ORIGINAL":
+        return tender["original_anchor_month"], tender["original_anchor_cpi"], tender["original_base_value"]
+    return tender["current_anchor_month"], tender["current_anchor_cpi"], tender["current_adjusted_price"]
+
+
 def _month_label(month: str, anchor_month: str, anniversary_months: set) -> str:
     if month in anniversary_months:
         year_n = _months_since_anchor(anchor_month, month) // 12
@@ -471,19 +496,21 @@ if trigger_anchor:
 elif trigger_check and selected_tender and check_month:
     try:
         validator = SCMDataValidator(ARCHIVE_PATH)
-        # A non-mutating preview against whatever is CURRENTLY in effect --
-        # the original tender submission's anchor only matters for how
-        # Annual Escalation derives a new figure (see below), not for this.
+        # A non-mutating preview against whichever reference point this
+        # tender's formula calls for -- same helper Calculate/Confirm Annual
+        # Escalation use, so a monthly check is always consistent with what
+        # the next escalation would actually compute for this tender.
+        check_anchor_month, check_anchor_cpi, check_base_price = _formula_reference_point(selected_tender)
         timeline_results, stage_results, extras, output_hash = validator.run_monthly_check(
-            anchor_month=selected_tender["current_anchor_month"],
-            anchor_cpi_value=selected_tender["current_anchor_cpi"],
+            anchor_month=check_anchor_month,
+            anchor_cpi_value=check_anchor_cpi,
             check_month=check_month,
             tender_id=selected_tender["tender_id"],
         )
         st.session_state["last_result"] = {
             "banner": None,
             "tender_id": selected_tender["tender_id"], "tender_name": selected_tender["tender_name"],
-            "baseline_type": selected_tender["baseline_type"], "base_value": selected_tender["current_adjusted_price"],
+            "baseline_type": selected_tender["baseline_type"], "base_value": check_base_price,
             "start_date_str": selected_tender["start_date"], "end_date_str": selected_tender["end_date"],
             "timeline_results": timeline_results, "stage_results": stage_results,
             "extras": extras, "output_hash": output_hash,
@@ -520,16 +547,10 @@ elif trigger_calculate_escalation and selected_tender and check_month:
 
         # This is the whole formula distinction: CUMULATIVE always derives
         # from the untouched original tender submission; COMPOUND derives
-        # from whatever the last approved escalation left as current.
+        # from whatever the last approved escalation left as current. Same
+        # helper "Run Monthly Check" uses, so the two are never inconsistent.
         formula_type = selected_tender.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL")
-        if formula_type == "CUMULATIVE_FROM_ORIGINAL":
-            calc_anchor_month = selected_tender["original_anchor_month"]
-            calc_anchor_cpi = selected_tender["original_anchor_cpi"]
-            calc_base_price = selected_tender["original_base_value"]
-        else:  # COMPOUND_FROM_PRIOR_YEAR
-            calc_anchor_month = selected_tender["current_anchor_month"]
-            calc_anchor_cpi = selected_tender["current_anchor_cpi"]
-            calc_base_price = selected_tender["current_adjusted_price"]
+        calc_anchor_month, calc_anchor_cpi, calc_base_price = _formula_reference_point(selected_tender)
 
         validator = SCMDataValidator(ARCHIVE_PATH)
         # This year's validated drift against whichever anchor the formula
@@ -647,14 +668,7 @@ if "pending_escalation" in st.session_state:
                 # base the calculate step used -- never trust the stashed
                 # pending numbers as the thing actually written to the
                 # registry.
-                if pend["formula_type"] == "CUMULATIVE_FROM_ORIGINAL":
-                    calc_anchor_month = current["original_anchor_month"]
-                    calc_anchor_cpi = current["original_anchor_cpi"]
-                    calc_base_price = current["original_base_value"]
-                else:
-                    calc_anchor_month = current["current_anchor_month"]
-                    calc_anchor_cpi = current["current_anchor_cpi"]
-                    calc_base_price = current["current_adjusted_price"]
+                calc_anchor_month, calc_anchor_cpi, calc_base_price = _formula_reference_point(current)
 
                 validator = SCMDataValidator(ARCHIVE_PATH)
                 timeline_results, stage_results, extras, output_hash = validator.run_monthly_check(
