@@ -267,9 +267,9 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         )
     with out_col2:
         st.download_button(
-            label="Export Gold Standard ERP Payload (.json)",
+            label="Download Gold Standard Data Export (.json)",
             data=json_bytes,
-            file_name=f"ERP_Payload_{tender_id}_{file_month_tag}.json",
+            file_name=f"DataExport_{tender_id}_{file_month_tag}.json",
             mime="application/json",
         )
 
