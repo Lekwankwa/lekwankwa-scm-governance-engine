@@ -6,8 +6,11 @@ import streamlit as st
 
 from core.validator import SCMDataValidator
 from core.tender_registry import (
-    apply_correction, get_correction_history, get_effective_escalation_price,
-    get_tender, list_tenders, record_escalation, save_tender, tender_exists,
+    apply_correction, archive_tender, correct_tender_metadata, get_correction_history,
+    get_effective_escalation_price, get_effective_tender_field, get_tender,
+    has_tender_activity, list_tenders, log_check, record_escalation,
+    resolve_effective_tender, save_tender, tender_exists, update_tender_metadata_direct,
+    METADATA_CORRECTABLE_FIELDS,
 )
 from utils.document_gen import build_audit_pdf
 
@@ -63,10 +66,33 @@ def _formula_reference_point(tender: dict) -> tuple:
 
     Before any escalation has happened, original_* and current_* are
     identical, so this makes no difference either way.
+
+    Resolves to the EFFECTIVE original_base_value / cpa_formula_type first
+    (resolve_effective_tender()) rather than the raw stored fields -- so a
+    metadata correction to either one (see core/tender_registry.py's
+    correct_tender_metadata()) automatically applies to every future
+    calculation through this one function, without needing to be threaded
+    through each of this function's three callers individually. This is the
+    same class of fix as the original bug this function was written to
+    solve: one source of truth instead of scattered call sites.
     """
+    tender = resolve_effective_tender(tender)
     if tender.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL") == "CUMULATIVE_FROM_ORIGINAL":
         return tender["original_anchor_month"], tender["original_anchor_cpi"], tender["original_base_value"]
     return tender["current_anchor_month"], tender["current_anchor_cpi"], tender["current_adjusted_price"]
+
+
+def _format_metadata_value(field: str, value) -> str:
+    """Currency formatting for original_base_value, plain string for every
+    other correctable metadata field -- a single f"{v:,.2f}" applied
+    uniformly would crash/misrender for tender_name/start_date/
+    end_date/cpa_formula_type."""
+    if field == "original_base_value":
+        try:
+            return f"R{float(value):,.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
 
 
 def _month_label(month: str, anchor_month: str, anniversary_months: set) -> str:
@@ -81,7 +107,8 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
                           stage_results=None, extras=None, output_hash="N/A",
                           document_title="Audit-Ready Compliance Record",
                           escalation_info=None, correction_detail=None,
-                          correction_history=None):
+                          correction_history=None, metadata_correction_detail=None,
+                          archive_detail=None, full_escalation_history=None):
     """Shared output rendering for the anchor event and every later
     monthly/annual check/escalation/correction -- metrics, the real
     10-stage panel, the results table, and the PDF/JSON downloads. Used
@@ -102,6 +129,21 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
     tender that has ever had a correction applied -- not just the
     correction's own record -- per the "never just the final number with
     no trace of what changed" requirement.
+
+    metadata_correction_detail: same "just applied" notice pattern as
+    correction_detail, but for a tender-metadata correction (see
+    core/tender_registry.py's correct_tender_metadata()).
+
+    archive_detail: {reason, archived_by, archived_at, just_archived}. When
+    just_archived is True this is "you just archived this tender" (a
+    formal, prominent notice); when False it's "you are viewing an already-
+    archived tender" (a calmer informational one), used by the Archived /
+    Closed Contracts browse mode.
+
+    full_escalation_history: the tender's COMPLETE escalation_history (every
+    year, not just the latest) -- only passed by the Archived / Closed
+    Contracts browse view, so routine check/escalation renders are visually
+    unchanged.
     """
     extras = extras or {}
     correction_history = correction_history or []
@@ -126,7 +168,8 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         is_compound = escalation_info.get("formula_type") == "COMPOUND_FROM_PRIOR_YEAR"
         derivation_lines = [
             f"Formula Type Used: {escalation_info.get('formula_type', 'N/A')}",
-            f"Original Baseline (permanent, {escalation_info.get('original_anchor_month', 'N/A')}): "
+            f"Original Baseline (fixed against escalation rollups, "
+            f"{escalation_info.get('original_anchor_month', 'N/A')}): "
             f"CPI {escalation_info.get('original_anchor_cpi', 'N/A')}, "
             f"Base R{escalation_info.get('original_base_zar', 0):,.2f}",
         ]
@@ -150,6 +193,34 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
             f"R{cd['corrected_figure']:,.2f}. Reason: {cd['reason']}. Approved by "
             f"{cd['corrected_by']} on {cd.get('corrected_at', 'N/A')}.{cascade_line}"
         )
+
+    if metadata_correction_detail:
+        mcd = metadata_correction_detail
+        notice = (
+            f"This is a formal correction to tender metadata. Field '{mcd['field']}' revised "
+            f"from '{mcd['original_value']}' to '{mcd['corrected_value']}'. Reason: {mcd['reason']}. "
+            f"Approved by {mcd['corrected_by']} on {mcd.get('corrected_at', 'N/A')}."
+        )
+        # Amber/warning-toned when this correction touches an already-relied-on
+        # calculation input (see correct_tender_metadata()'s retroactive_impact_flag) --
+        # "flag for human review" tone, distinct from a routine correction's tone.
+        if mcd.get("retroactive_impact_flag"):
+            st.warning(notice + f" ⚠ {mcd.get('retroactive_impact_note', '')}")
+        else:
+            st.error(notice)
+
+    if archive_detail:
+        ad = archive_detail
+        notice = (
+            f"This tender is ARCHIVED. Reason: {ad['reason']}. Archived by "
+            f"{ad['archived_by']} on {ad['archived_at']}. It is hidden from the active "
+            "'Open Existing Tender' working list; its full history remains fully "
+            "retrievable via 'Archived / Closed Contracts'."
+        )
+        if ad.get("just_archived"):
+            st.error(notice)
+        else:
+            st.info(notice)
 
     # METRIC DISPLAY MATRIX (Top Layer Visualization) -- only for a
     # CPI-driven record (anchor / monthly check / escalation); a pure
@@ -193,6 +264,25 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         st.dataframe(pd.DataFrame(timeline_results), use_container_width=True)
         st.markdown("---")
 
+    # Only rendered by the Archived / Closed Contracts browse view -- the
+    # COMPLETE escalation_history (every year), not just the latest, so
+    # nothing about a closed contract's history is ever hidden.
+    if full_escalation_history:
+        st.subheader("Full Escalation History")
+        display_rows = [
+            {
+                "Year": e["new_anchor_month"], "Formula": e["formula_type"],
+                "Prior CPI": e["prior_anchor_cpi"], "New CPI": e["new_anchor_cpi"],
+                "Prior Price (R)": e["prior_adjusted_price"],
+                "Approved Price (R)": e["new_adjusted_price"],
+                "Effective Price (R)": get_effective_escalation_price(e),
+                "Approved By": e["approved_by"], "Approved At": e["escalated_at"],
+            }
+            for e in full_escalation_history
+        ]
+        st.dataframe(pd.DataFrame(display_rows), use_container_width=True)
+        st.markdown("---")
+
     if correction_history:
         st.subheader("Correction History")
         st.caption("Shown on every document for this tender, per the requirement that a correction "
@@ -203,7 +293,15 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
                 st.markdown(f"**{c['year_month']} — Correction{cascade_tag}**")
                 st.caption(f"Original: R{c['original_figure']:,.2f} -> Corrected: R{c['corrected_figure']:,.2f} | "
                             f"Reason: {c['reason']} | Approved by: {c['corrected_by']} on {c['corrected_at']}")
-            else:
+            elif c["type"] == "METADATA_CORRECTION":
+                flag_tag = " ⚠ FLAGGED FOR REVIEW" if c.get("retroactive_impact_flag") else ""
+                st.markdown(f"**Metadata — {c['field']}{flag_tag}**")
+                st.caption(f"Original: {_format_metadata_value(c['field'], c['original_value'])} -> "
+                            f"Corrected: {_format_metadata_value(c['field'], c['corrected_value'])} | "
+                            f"Reason: {c['reason']} | Approved by: {c['corrected_by']} on {c['corrected_at']}")
+                if c.get("retroactive_impact_note"):
+                    st.caption(c["retroactive_impact_note"])
+            else:  # STALE_INPUT_FLAG
                 st.markdown(f"**{c['year_month']} — Stale Input Flag**")
                 st.caption(c["note"])
         st.markdown("---")
@@ -234,6 +332,9 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         "audit_lineage": timeline_results or [],
         "escalation": escalation_info,
         "correction": correction_detail,
+        "metadata_correction": metadata_correction_detail,
+        "archive": archive_detail,
+        "full_escalation_history": full_escalation_history,
         "correction_history": correction_history,
     }
     json_bytes = json.dumps(gold_standard_json, indent=4, default=str).encode("utf-8")
@@ -248,14 +349,21 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         escalation_info=escalation_info,
         correction_detail=correction_detail,
         correction_history=correction_history,
+        metadata_correction_detail=metadata_correction_detail,
+        archive_detail=archive_detail,
+        full_escalation_history=full_escalation_history,
         output_hash=output_hash,
     )
 
-    # A pure correction record has no CPI timeline to pull a month tag from
-    # for the file name -- fall back to the corrected year, then a plain tag.
+    # A pure correction/metadata-correction/archive record has no CPI
+    # timeline to pull a month tag from for the file name -- fall back
+    # through each record type's own natural date, then a plain tag.
     file_month_tag = (
         timeline_results[-1]["month"] if timeline_results
-        else (correction_detail["year_month"] if correction_detail else "record")
+        else correction_detail["year_month"] if correction_detail
+        else metadata_correction_detail["corrected_at"][:10] if metadata_correction_detail
+        else "archived" if archive_detail
+        else "record"
     )
     out_col1, out_col2 = st.columns(2)
     with out_col1:
@@ -274,16 +382,129 @@ def render_result_block(tender_id, tender_name, baseline_type, base_value,
         )
 
 
+def render_metadata_edit_or_correct_block(tender: dict, key_prefix: str) -> dict:
+    """Renders EITHER a direct-edit form (zero check/escalation/correction
+    activity yet) OR a gated correct-metadata form (has activity), for
+    `tender`. Called from both "Open Existing Tender" (active tenders) and
+    "Archived / Closed Contracts" (archived ones) -- an archived tender is
+    just as correctable as an active one, and a zero-history archived
+    tender (archived immediately with no activity) still gets the
+    direct-edit form, since has_tender_activity() is independent of status.
+
+    Only renders widgets and returns what the clerk requested this run --
+    never mutates the registry itself, matching this file's existing
+    convention (sidebar collects, the MAIN FRAME PROCESSING section below
+    acts). key_prefix keeps widget keys distinct between the two call
+    sites even though only one ever renders per script run (registry_mode
+    is a single radio -- only one mode's branch executes at a time).
+    """
+    result = {
+        "trigger_direct_edit": False, "direct_edit_data": None,
+        "trigger_preview_correction": False, "preview_data": None,
+    }
+    effective = resolve_effective_tender(tender)
+    is_annual = tender["baseline_type"] == "Total Annual Contract Allocation Value"
+    formula_labels = {
+        "CUMULATIVE_FROM_ORIGINAL": "Cumulative from Original Anchor",
+        "COMPOUND_FROM_PRIOR_YEAR": "Compound from Prior Year",
+    }
+
+    with st.expander("Edit / Correct Tender Metadata"):
+        if not has_tender_activity(tender):
+            st.caption("No checks, approved escalations, or prior corrections yet -- "
+                        "this tender's metadata can still be edited directly.")
+            new_name = st.text_input("Tender / Project Name", value=effective["tender_name"],
+                                       key=f"{key_prefix}_meta_name")
+            new_start = st.date_input("Contract Start Date (Anchor Month)",
+                                        value=datetime.date.fromisoformat(effective["start_date"]),
+                                        key=f"{key_prefix}_meta_start")
+            new_end = st.date_input("Contract End Date",
+                                      value=datetime.date.fromisoformat(effective["end_date"]),
+                                      key=f"{key_prefix}_meta_end")
+            new_base = st.number_input("Base Contract Valuation (ZAR)", min_value=1.0,
+                                         value=float(effective["original_base_value"]), step=1000.0,
+                                         key=f"{key_prefix}_meta_base")
+            if is_annual:
+                current_formula = effective.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL")
+                new_formula = st.radio(
+                    "Annual CPA Formula Type", ["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"],
+                    index=["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"].index(current_formula),
+                    format_func=lambda x: formula_labels[x], key=f"{key_prefix}_meta_formula",
+                )
+            else:
+                new_formula = "CUMULATIVE_FROM_ORIGINAL"
+
+            if new_start >= new_end:
+                st.error("Contract End Date must be strictly after the Start Date.")
+            elif st.button("Save Changes", key=f"{key_prefix}_meta_save"):
+                result["trigger_direct_edit"] = True
+                result["direct_edit_data"] = {
+                    "tender_id": tender["tender_id"], "tender_name": new_name,
+                    "start_date": new_start, "end_date": new_end,
+                    "original_base_value": new_base, "cpa_formula_type": new_formula,
+                }
+        else:
+            st.caption("This tender has check/escalation/correction history -- metadata can no "
+                        "longer be edited directly. This layers a new, separately dated "
+                        "correction on top, same pattern already used for CPI figures.")
+            correctable_fields = [f for f in METADATA_CORRECTABLE_FIELDS if f != "cpa_formula_type" or is_annual]
+            field_labels = {
+                "tender_name": "Tender / Project Name", "start_date": "Contract Start Date",
+                "end_date": "Contract End Date", "original_base_value": "Base Contract Valuation (ZAR)",
+                "cpa_formula_type": "Annual CPA Formula Type",
+            }
+            field = st.selectbox("Field to Correct", correctable_fields,
+                                   format_func=lambda f: field_labels[f], key=f"{key_prefix}_meta_field")
+            current_val = get_effective_tender_field(tender, field)
+            st.caption(f"Current effective value: {_format_metadata_value(field, current_val)}")
+
+            if field == "original_base_value":
+                new_val = st.number_input("Corrected Value (ZAR)", min_value=0.01,
+                                            value=float(current_val), step=1000.0,
+                                            key=f"{key_prefix}_meta_newval")
+            elif field in ("start_date", "end_date"):
+                new_val = str(st.date_input("Corrected Value", value=datetime.date.fromisoformat(current_val),
+                                              key=f"{key_prefix}_meta_newval"))
+            elif field == "cpa_formula_type":
+                new_val = st.radio("Corrected Value", ["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"],
+                                     format_func=lambda x: formula_labels[x], key=f"{key_prefix}_meta_newval")
+            else:
+                new_val = st.text_input("Corrected Value", value=str(current_val), key=f"{key_prefix}_meta_newval")
+
+            reason = st.text_area("Reason for Correction (required)", key=f"{key_prefix}_meta_reason",
+                                    placeholder="e.g. data entry error, dispute resolution, audit finding")
+
+            if field in ("original_base_value", "cpa_formula_type") and tender.get("escalation_history"):
+                st.warning(f"This tender has {len(tender['escalation_history'])} already-approved "
+                            "escalation(s) calculated using the current value. Correcting it will NOT "
+                            "retroactively recalculate those records -- flagged for manual review.")
+
+            if st.button("Preview Metadata Correction", key=f"{key_prefix}_meta_preview"):
+                result["trigger_preview_correction"] = True
+                result["preview_data"] = {
+                    "tender_id": tender["tender_id"], "field": field,
+                    "corrected_value": new_val, "reason": reason,
+                }
+    return result
+
+
 # TENDER REGISTRY (Sidebar UI)
 with st.sidebar:
     st.header("Tender Registry")
-    registry_mode = st.radio("Mode", ["Anchor New Tender", "Open Existing Tender", "Correct Prior Escalation"])
+    registry_mode = st.radio("Mode", [
+        "Anchor New Tender", "Open Existing Tender",
+        "Correct Prior Escalation", "Archived / Closed Contracts",
+    ])
     st.markdown("---")
 
     trigger_anchor = False
     trigger_check = False
     trigger_calculate_escalation = False
     trigger_preview_correction = False
+    trigger_archive = False
+    trigger_direct_metadata_edit = False
+    trigger_preview_metadata_correction = False
+    trigger_view_archived = False
     selected_tender = None
     check_month = None
     check_month_is_anniversary = False
@@ -292,6 +513,11 @@ with st.sidebar:
     correction_figure = None
     correction_reason = None
     correction_cascade_mode = "ISOLATED"
+    archive_target_tender = None
+    archive_reason = None
+    direct_edit_data = None
+    metadata_correction_preview_data = None
+    archived_tender = None
 
     if registry_mode == "Anchor New Tender":
         st.header("Tender Configuration Panel")
@@ -331,20 +557,28 @@ with st.sidebar:
 
     elif registry_mode == "Open Existing Tender":
         st.header("Open Existing Tender")
-        tenders = list_tenders()
+        # ARCHIVED tenders are hidden from this day-to-day working list --
+        # the one status filter in the whole app. They stay fully visible
+        # and correctable via "Archived / Closed Contracts" instead.
+        tenders = [t for t in list_tenders() if t.get("status", "ACTIVE") != "ARCHIVED"]
         if not tenders:
-            st.info("No tenders anchored yet. Switch to 'Anchor New Tender' first.")
+            st.info("No active tenders anchored yet. Switch to 'Anchor New Tender' first, "
+                      "or check 'Archived / Closed Contracts' if you expected one here.")
         else:
-            options = {f"{t['tender_id']} - {t['tender_name']}": t["tender_id"] for t in tenders}
+            # Dropdown labels use the EFFECTIVE (post-correction) tender name so a
+            # corrected name shows up going forward.
+            options = {f"{t['tender_id']} - {resolve_effective_tender(t)['tender_name']}": t["tender_id"]
+                       for t in tenders}
             picked_label = st.selectbox("Select Tender", list(options.keys()))
             selected_tender = get_tender(options[picked_label])
+            effective_tender = resolve_effective_tender(selected_tender)
 
             st.caption(f"Baseline: {selected_tender['baseline_type']}")
             if selected_tender["baseline_type"] == "Total Annual Contract Allocation Value":
-                st.caption(f"CPA Formula: {selected_tender.get('cpa_formula_type', 'CUMULATIVE_FROM_ORIGINAL')}")
-            st.caption(f"Original Anchor (permanent): {selected_tender['original_anchor_month']} "
+                st.caption(f"CPA Formula: {effective_tender.get('cpa_formula_type', 'CUMULATIVE_FROM_ORIGINAL')}")
+            st.caption(f"Original Anchor (fixed against escalation rollups): {selected_tender['original_anchor_month']} "
                         f"@ CPI {selected_tender['original_anchor_cpi']} "
-                        f"(base R{selected_tender['original_base_value']:,.2f})")
+                        f"(base R{effective_tender['original_base_value']:,.2f})")
             st.caption(f"Current: {selected_tender['current_anchor_month']} "
                         f"@ CPI {selected_tender['current_anchor_cpi']} "
                         f"(adjusted price R{selected_tender['current_adjusted_price']:,.2f})")
@@ -380,7 +614,29 @@ with st.sidebar:
                 else:
                     trigger_check = st.button("Run Monthly Check")
 
-    else:  # registry_mode == "Correct Prior Escalation"
+            st.markdown("---")
+            meta_result = render_metadata_edit_or_correct_block(selected_tender, key_prefix="active")
+            if meta_result["trigger_direct_edit"]:
+                trigger_direct_metadata_edit = True
+                direct_edit_data = meta_result["direct_edit_data"]
+            if meta_result["trigger_preview_correction"]:
+                trigger_preview_metadata_correction = True
+                metadata_correction_preview_data = meta_result["preview_data"]
+
+            with st.expander("Archive This Tender"):
+                st.warning("Archiving is ONE-DIRECTIONAL -- there is no 'Reactivate' action. "
+                            "Nothing is deleted; the tender's full history stays fully retrievable "
+                            "via 'Archived / Closed Contracts', it just leaves this working list.")
+                archive_reason_input = st.text_area(
+                    "Reason for archiving (required)", key="archive_reason_input",
+                    placeholder="e.g. contract ended, entered in error, superseded",
+                )
+                if st.button("Archive This Tender", key="trigger_archive_btn"):
+                    trigger_archive = True
+                    archive_target_tender = selected_tender
+                    archive_reason = archive_reason_input
+
+    elif registry_mode == "Correct Prior Escalation":
         st.header("Correct Prior Escalation")
         st.write("An approved annual price is never edited in place. This layers a new, "
                   "separately dated correction on top -- the original approved figure is kept forever.")
@@ -388,7 +644,8 @@ with st.sidebar:
         if not correctable:
             st.info("No tenders have any approved Annual Escalation yet to correct.")
         else:
-            options = {f"{t['tender_id']} - {t['tender_name']}": t["tender_id"] for t in correctable}
+            options = {f"{t['tender_id']} - {resolve_effective_tender(t)['tender_name']}": t["tender_id"]
+                       for t in correctable}
             picked_label = st.selectbox("Select Tender", list(options.keys()), key="correction_tender_select")
             correction_tender = get_tender(options[picked_label])
             history = correction_tender["escalation_history"]
@@ -419,7 +676,7 @@ with st.sidebar:
 
             idx = year_options.index(correction_year_month)
             has_later_years = idx < len(year_options) - 1
-            is_compound_tender = correction_tender.get("cpa_formula_type") == "COMPOUND_FROM_PRIOR_YEAR"
+            is_compound_tender = resolve_effective_tender(correction_tender)["cpa_formula_type"] == "COMPOUND_FROM_PRIOR_YEAR"
             if has_later_years and is_compound_tender:
                 correction_cascade_mode = st.radio(
                     "How should subsequent already-approved years be handled?",
@@ -436,6 +693,37 @@ with st.sidebar:
 
             st.markdown("---")
             trigger_preview_correction = st.button("Preview Correction")
+
+    else:  # registry_mode == "Archived / Closed Contracts"
+        st.header("Archived / Closed Contracts")
+        st.write("Nothing about an archived tender is ever hidden or deleted -- its full anchor, "
+                  "escalation, and correction history remains fully retrievable here.")
+        archived_list = [t for t in list_tenders() if t.get("status") == "ARCHIVED"]
+        if not archived_list:
+            st.info("No archived tenders yet.")
+        else:
+            options = {f"{t['tender_id']} - {resolve_effective_tender(t)['tender_name']}": t["tender_id"]
+                       for t in archived_list}
+            picked_label = st.selectbox("Select Archived Tender", list(options.keys()), key="archived_tender_select")
+            archived_tender = get_tender(options[picked_label])
+            ai = archived_tender.get("archive_info", {})
+            st.caption(f"Archived by {ai.get('archived_by', 'N/A')} on {ai.get('archived_at', 'N/A')} "
+                        f"-- Reason: {ai.get('reason', 'N/A')}")
+
+            st.markdown("---")
+            meta_result = render_metadata_edit_or_correct_block(archived_tender, key_prefix="archived")
+            if meta_result["trigger_direct_edit"]:
+                trigger_direct_metadata_edit = True
+                direct_edit_data = meta_result["direct_edit_data"]
+            if meta_result["trigger_preview_correction"]:
+                trigger_preview_metadata_correction = True
+                metadata_correction_preview_data = meta_result["preview_data"]
+
+            st.markdown("---")
+            # Consistent with every other action in this app (mutating or not,
+            # e.g. "Run Monthly Check") requiring an explicit click before
+            # anything renders into the main frame -- no auto-render on select.
+            trigger_view_archived = st.button("View Full History")
 
 # MAIN FRAME PROCESSING GRAPHICS
 if trigger_anchor:
@@ -471,6 +759,7 @@ if trigger_anchor:
                 "current_anchor_cpi": anchor_record["anchor_cpi"],
                 "current_adjusted_price": base_value,
                 "created_at": datetime.datetime.now().isoformat(),
+                "status": "ACTIVE",
             })
 
             # Stashed in session_state rather than rendered directly: st.download_button
@@ -507,18 +796,23 @@ elif trigger_check and selected_tender and check_month:
             check_month=check_month,
             tender_id=selected_tender["tender_id"],
         )
+        # Audit-log-only: no CPI/price/anchor figure is touched by this call
+        # (see log_check()'s docstring) -- it just makes "has this tender ever
+        # been checked" gate-able for metadata correction.
+        updated_tender = log_check(selected_tender["tender_id"], check_month)
+        effective_tender = resolve_effective_tender(updated_tender)
         st.session_state["last_result"] = {
             "banner": None,
-            "tender_id": selected_tender["tender_id"], "tender_name": selected_tender["tender_name"],
-            "baseline_type": selected_tender["baseline_type"], "base_value": check_base_price,
-            "start_date_str": selected_tender["start_date"], "end_date_str": selected_tender["end_date"],
+            "tender_id": effective_tender["tender_id"], "tender_name": effective_tender["tender_name"],
+            "baseline_type": effective_tender["baseline_type"], "base_value": check_base_price,
+            "start_date_str": effective_tender["start_date"], "end_date_str": effective_tender["end_date"],
             "timeline_results": timeline_results, "stage_results": stage_results,
             "extras": extras, "output_hash": output_hash,
             "document_title": "Monthly Invoice Verification Record", "escalation_info": None,
             "correction_detail": None,
             # Every document for a tender that has ever been corrected shows
             # the full trail, not just the correction's own record.
-            "correction_history": get_correction_history(selected_tender),
+            "correction_history": get_correction_history(updated_tender),
         }
     except ValueError as e:
         st.error(f"Validation Pipeline Halted: {e}")
@@ -549,7 +843,10 @@ elif trigger_calculate_escalation and selected_tender and check_month:
         # from the untouched original tender submission; COMPOUND derives
         # from whatever the last approved escalation left as current. Same
         # helper "Run Monthly Check" uses, so the two are never inconsistent.
-        formula_type = selected_tender.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL")
+        # Reads the EFFECTIVE formula type/base value (post metadata-correction,
+        # if any) via resolve_effective_tender() -- see _formula_reference_point().
+        effective_selected_tender = resolve_effective_tender(selected_tender)
+        formula_type = effective_selected_tender.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL")
         calc_anchor_month, calc_anchor_cpi, calc_base_price = _formula_reference_point(selected_tender)
 
         validator = SCMDataValidator(ARCHIVE_PATH)
@@ -575,7 +872,7 @@ elif trigger_calculate_escalation and selected_tender and check_month:
             "formula_type": formula_type,
             "original_anchor_month": selected_tender["original_anchor_month"],
             "original_anchor_cpi": selected_tender["original_anchor_cpi"],
-            "original_base_value": selected_tender["original_base_value"],
+            "original_base_value": effective_selected_tender["original_base_value"],
             "prior_anchor_month": selected_tender["current_anchor_month"],
             "prior_anchor_cpi": selected_tender["current_anchor_cpi"],
             "prior_adjusted_price": selected_tender["current_adjusted_price"],
@@ -609,7 +906,7 @@ if "pending_escalation" in st.session_state:
         "",
         f"Formula Type: {pend['formula_type']}",
         "",
-        f"Original Baseline (permanent, {pend['original_anchor_month']}): "
+        f"Original Baseline (fixed against escalation rollups, {pend['original_anchor_month']}): "
         f"CPI {pend['original_anchor_cpi']}, Base R{pend['original_base_value']:,.2f}",
     ]
     if is_compound:
@@ -707,7 +1004,7 @@ if "pending_escalation" in st.session_state:
                         "formula_type": pend["formula_type"],
                         "original_anchor_month": updated["original_anchor_month"],
                         "original_anchor_cpi": updated["original_anchor_cpi"],
-                        "original_base_zar": updated["original_base_value"],
+                        "original_base_zar": resolve_effective_tender(updated)["original_base_value"],
                         "prior_anchor_month": pend["prior_anchor_month"],
                         "prior_adjusted_price": pend["prior_adjusted_price"],
                     },
@@ -738,7 +1035,7 @@ elif trigger_preview_correction and correction_tender and correction_year_month:
             "baseline_type": correction_tender["baseline_type"],
             "start_date": correction_tender["start_date"],
             "end_date": correction_tender["end_date"],
-            "cpa_formula_type": correction_tender.get("cpa_formula_type"),
+            "cpa_formula_type": resolve_effective_tender(correction_tender).get("cpa_formula_type"),
             "year_month": correction_year_month,
             "corrected_figure": correction_figure,
             "reason": correction_reason,
@@ -749,6 +1046,91 @@ elif trigger_preview_correction and correction_tender and correction_year_month:
         }
     except ValueError as e:
         st.error(f"Correction Rejected: {e}")
+
+elif trigger_direct_metadata_edit and direct_edit_data:
+    # No approval gate -- legal ONLY while the tender has zero activity
+    # (server-side re-checked inside update_tender_metadata_direct() itself,
+    # not just gated by which UI branch rendered the button).
+    d = direct_edit_data
+    try:
+        if d["start_date"] >= d["end_date"]:
+            st.error("Operational Error: Contract End Date must be strictly after the Start Date.")
+        else:
+            updated = update_tender_metadata_direct(
+                d["tender_id"], d["tender_name"], str(d["start_date"]), str(d["end_date"]),
+                d["original_base_value"], d["cpa_formula_type"],
+            )
+            st.session_state["last_result"] = {
+                "banner": f"Tender '{updated['tender_id']}' metadata updated (no history existed yet -- "
+                          "no approval gate required).",
+                "tender_id": updated["tender_id"], "tender_name": updated["tender_name"],
+                "baseline_type": updated["baseline_type"], "base_value": updated["current_adjusted_price"],
+                "start_date_str": updated["start_date"], "end_date_str": updated["end_date"],
+                "timeline_results": None, "stage_results": None,
+                "extras": {}, "output_hash": "N/A",
+                "document_title": "Tender Anchor Record", "escalation_info": None,
+                "correction_detail": None, "correction_history": [],
+            }
+    except ValueError as e:
+        st.error(f"Metadata Edit Rejected: {e}")
+    except Exception as e:
+        st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
+
+elif trigger_preview_metadata_correction and metadata_correction_preview_data:
+    # PREVIEW ONLY -- a dry_run, nothing written to the registry. Mirrors
+    # trigger_preview_correction's exact shape above.
+    d = metadata_correction_preview_data
+    try:
+        preview = correct_tender_metadata(
+            d["tender_id"], d["field"], d["corrected_value"], d["reason"] or "",
+            corrected_by=None, dry_run=True,
+        )
+        latest = preview["metadata_corrections"][-1]
+        st.session_state["pending_metadata_correction"] = {
+            "tender_id": preview["tender_id"], "tender_name": resolve_effective_tender(preview)["tender_name"],
+            "field": latest["field"], "original_value": latest["original_value"],
+            "corrected_value": latest["corrected_value"], "reason": latest["reason"],
+            "retroactive_impact_flag": latest["retroactive_impact_flag"],
+            "retroactive_impact_note": latest["retroactive_impact_note"],
+            "calculated_at": datetime.datetime.now().isoformat(),
+        }
+    except ValueError as e:
+        st.error(f"Correction Rejected: {e}")
+
+elif trigger_archive and archive_target_tender:
+    # CALCULATE-free: archiving has nothing to derive/preview, so this
+    # stashes a pending confirmation directly (matching Anchor Tender's own
+    # single-step-but-validated shape) rather than the calculate-then-approve
+    # gate used for escalations/corrections, which exists specifically to
+    # preview a DERIVED number before committing to it.
+    if not archive_reason or not archive_reason.strip():
+        st.error("A reason is required to archive a tender.")
+    else:
+        st.session_state["pending_archive"] = {
+            "tender_id": archive_target_tender["tender_id"],
+            "tender_name": resolve_effective_tender(archive_target_tender)["tender_name"],
+            "reason": archive_reason.strip(),
+            "requested_at": datetime.datetime.now().isoformat(),
+        }
+
+elif trigger_view_archived and archived_tender:
+    ai = archived_tender.get("archive_info", {})
+    effective_tender = resolve_effective_tender(archived_tender)
+    st.session_state["last_result"] = {
+        "banner": None,
+        "tender_id": effective_tender["tender_id"], "tender_name": effective_tender["tender_name"],
+        "baseline_type": effective_tender["baseline_type"],
+        "base_value": archived_tender["current_adjusted_price"],
+        "start_date_str": effective_tender["start_date"], "end_date_str": effective_tender["end_date"],
+        "timeline_results": None, "stage_results": None,
+        "extras": {}, "output_hash": "N/A",
+        "document_title": "Archived Tender -- Full Audit Record",
+        "escalation_info": None, "correction_detail": None,
+        "correction_history": get_correction_history(archived_tender),
+        "metadata_correction_detail": None,
+        "archive_detail": {**ai, "just_archived": False},
+        "full_escalation_history": archived_tender.get("escalation_history", []),
+    }
 
 # PENDING CORRECTION -- APPROVAL GATE
 # Same pattern as the escalation gate above: nothing is applied to the
@@ -849,6 +1231,128 @@ if "pending_correction" in st.session_state:
             except Exception as e:
                 st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
 
+# PENDING ARCHIVE -- APPROVAL GATE
+# Same shape as the escalation/correction gates: nothing is applied to the
+# registry until a named archived_by is given and Confirm is clicked.
+if "pending_archive" in st.session_state:
+    pa = st.session_state["pending_archive"]
+    st.markdown("---")
+    st.warning(
+        f"PENDING ARCHIVE for '{pa['tender_id']}' ({pa['tender_name']}) -- NOT YET APPLIED.\n\n"
+        f"Reason: {pa['reason']}\n\n"
+        "This is ONE-DIRECTIONAL -- there is no 'Reactivate' action. The tender's full history "
+        "is never deleted or altered; it only leaves the active 'Open Existing Tender' list."
+    )
+    archived_by_name = st.text_input(
+        "Archived By (name / role, required to apply)", key="archived_by_input",
+        placeholder="e.g. T. Mokoena, SCM Clerk",
+    )
+    confirm_arc_col, discard_arc_col = st.columns(2)
+    with confirm_arc_col:
+        confirm_archive_clicked = st.button("Confirm & Apply Archive")
+    with discard_arc_col:
+        discard_archive_clicked = st.button("Discard Pending Archive")
+
+    if discard_archive_clicked:
+        del st.session_state["pending_archive"]
+        st.rerun()
+
+    if confirm_archive_clicked:
+        if not archived_by_name or not archived_by_name.strip():
+            st.error("Archived By is required before an archive can be applied.")
+        else:
+            try:
+                updated = archive_tender(pa["tender_id"], pa["reason"], archived_by_name.strip())
+                effective_tender = resolve_effective_tender(updated)
+                st.session_state["last_result"] = {
+                    "banner": f"Tender '{updated['tender_id']}' ARCHIVED. Archived by {archived_by_name.strip()}.",
+                    "tender_id": updated["tender_id"], "tender_name": effective_tender["tender_name"],
+                    "baseline_type": updated["baseline_type"],
+                    "base_value": updated["current_adjusted_price"],
+                    "start_date_str": effective_tender["start_date"], "end_date_str": effective_tender["end_date"],
+                    "timeline_results": None, "stage_results": None,
+                    "extras": {}, "output_hash": "N/A",
+                    "document_title": "Tender Archived Record",
+                    "escalation_info": None, "correction_detail": None,
+                    "correction_history": get_correction_history(updated),
+                    "metadata_correction_detail": None,
+                    "archive_detail": {**updated["archive_info"], "just_archived": True},
+                    "full_escalation_history": updated.get("escalation_history", []),
+                }
+                del st.session_state["pending_archive"]
+                st.rerun()
+            except (ValueError, KeyError) as e:
+                st.error(f"Archive Rejected: {e}")
+
+# PENDING METADATA CORRECTION -- APPROVAL GATE
+# Same shape as the CPI correction gate: nothing is applied to the registry
+# until a named corrected_by is given and Confirm is clicked.
+if "pending_metadata_correction" in st.session_state:
+    pmc = st.session_state["pending_metadata_correction"]
+    st.markdown("---")
+    lines = [
+        f"PENDING METADATA CORRECTION for '{pmc['tender_id']}' -- PROPOSED, NOT YET APPLIED.",
+        "",
+        f"Field: {pmc['field']}",
+        f"Original Value: {_format_metadata_value(pmc['field'], pmc['original_value'])}",
+        f"Proposed Corrected Value: {_format_metadata_value(pmc['field'], pmc['corrected_value'])}",
+        f"Reason: {pmc['reason']}",
+    ]
+    st.markdown("---")
+    if pmc["retroactive_impact_flag"]:
+        st.warning("\n\n".join(lines))
+        st.error(f"⚠ FLAGGED FOR HUMAN REVIEW: {pmc['retroactive_impact_note']}")
+    else:
+        st.warning("\n\n".join(lines))
+
+    metadata_corrector_name = st.text_input(
+        "Approver Name / Role (required to apply)", key="metadata_corrector_input",
+        placeholder="e.g. J. Naidoo, SCM Manager",
+    )
+    confirm_meta_col, discard_meta_col = st.columns(2)
+    with confirm_meta_col:
+        confirm_metadata_correction_clicked = st.button("Confirm & Apply Metadata Correction")
+    with discard_meta_col:
+        discard_metadata_correction_clicked = st.button("Discard Pending Metadata Correction")
+
+    if discard_metadata_correction_clicked:
+        del st.session_state["pending_metadata_correction"]
+        st.rerun()
+
+    if confirm_metadata_correction_clicked:
+        if not metadata_corrector_name or not metadata_corrector_name.strip():
+            st.error("Approver Name / Role is required before a metadata correction can be applied.")
+        else:
+            try:
+                updated = correct_tender_metadata(
+                    pmc["tender_id"], pmc["field"], pmc["corrected_value"], pmc["reason"],
+                    corrected_by=metadata_corrector_name.strip(),
+                )
+                latest = updated["metadata_corrections"][-1]
+                effective_tender = resolve_effective_tender(updated)
+                st.session_state["last_result"] = {
+                    "banner": f"Metadata correction APPLIED for '{updated['tender_id']}', field "
+                              f"'{pmc['field']}'. Approved by {metadata_corrector_name.strip()}.",
+                    "tender_id": updated["tender_id"], "tender_name": effective_tender["tender_name"],
+                    "baseline_type": updated["baseline_type"],
+                    "base_value": effective_tender["original_base_value"],
+                    "start_date_str": effective_tender["start_date"], "end_date_str": effective_tender["end_date"],
+                    "timeline_results": None, "stage_results": None,
+                    "extras": {}, "output_hash": "N/A",
+                    "document_title": "Tender Metadata Correction Record",
+                    "escalation_info": None, "correction_detail": None,
+                    "correction_history": get_correction_history(updated),
+                    "metadata_correction_detail": latest,
+                    "archive_detail": None,
+                    "full_escalation_history": None,
+                }
+                del st.session_state["pending_metadata_correction"]
+                st.rerun()
+            except ValueError as e:
+                st.error(f"Validation Pipeline Halted: {e}")
+            except Exception as e:
+                st.error(f"Technical Configuration Alert: Ensure your local historical database file exists. Error: {e}")
+
 # Renders whatever the most recent successful anchor/check/escalation/
 # correction produced. Lives outside the trigger blocks above so it
 # survives the reruns that clicking either download button inside it
@@ -865,4 +1369,7 @@ if "last_result" in st.session_state:
         escalation_info=res.get("escalation_info"),
         correction_detail=res.get("correction_detail"),
         correction_history=res.get("correction_history"),
+        metadata_correction_detail=res.get("metadata_correction_detail"),
+        archive_detail=res.get("archive_detail"),
+        full_escalation_history=res.get("full_escalation_history"),
     )

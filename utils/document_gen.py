@@ -102,6 +102,18 @@ def _kv_table(pdf: FPDF, rows: list[tuple[str, str]], label_width: float = 75):
         pdf.multi_cell(0, 7, _safe(value), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
+def _format_metadata_value(field: str, value) -> str:
+    """Currency formatting for original_base_value, plain string for every
+    other correctable metadata field -- mirrors app.py's identically-named
+    helper so the on-screen and PDF renderings never disagree."""
+    if field == "original_base_value":
+        try:
+            return f"R{float(value):,.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 def build_audit_pdf(
     tender_metadata: dict,
     stage_results: list = None,
@@ -113,6 +125,9 @@ def build_audit_pdf(
     escalation_info: dict = None,
     correction_detail: dict = None,
     correction_history: list = None,
+    metadata_correction_detail: dict = None,
+    archive_detail: dict = None,
+    full_escalation_history: list = None,
 ) -> bytes:
     """
     document_title distinguishes what kind of record this is -- different
@@ -146,6 +161,21 @@ def build_audit_pdf(
     to EVERY document generated for a tender that has ever been corrected,
     not just the correction's own record, so nobody reading e.g. a routine
     monthly check ever sees a final number with no trace of what changed.
+    Now also carries METADATA_CORRECTION entries alongside the existing
+    CORRECTION / STALE_INPUT_FLAG types -- one unified trail.
+
+    metadata_correction_detail: same "just applied" notice pattern as
+    correction_detail, but for a tender-metadata correction (see
+    core/tender_registry.py's correct_tender_metadata()).
+
+    archive_detail: {reason, archived_by, archived_at, just_archived} -- a
+    formal "this tender was just archived" notice, or a calmer "you are
+    viewing an archived tender" one for the Archived / Closed Contracts
+    browse view.
+
+    full_escalation_history: the tender's COMPLETE escalation_history
+    (every year, not just the latest) -- only passed by the Archived browse
+    view, so the exported PDF isn't missing anything the screen shows.
     """
     lineage = lineage or {}
     outliers = outliers or []
@@ -186,7 +216,7 @@ def build_audit_pdf(
         is_compound = escalation_info.get("formula_type") == "COMPOUND_FROM_PRIOR_YEAR"
         derivation_rows = [
             ("Formula Type Used", escalation_info.get("formula_type", "N/A")),
-            ("Original Baseline (permanent)",
+            ("Original Baseline (fixed against escalation rollups)",
              f"{escalation_info.get('original_anchor_month', 'N/A')} -- "
              f"CPI {escalation_info.get('original_anchor_cpi', 'N/A')}, "
              f"Base R{escalation_info.get('original_base_zar', 0):,.2f}"),
@@ -216,6 +246,42 @@ def build_audit_pdf(
             f"record. The figure is revised from R{cd['original_figure']:,.2f} to "
             f"R{cd['corrected_figure']:,.2f}. Reason: {cd['reason']}. Approved by "
             f"{cd['corrected_by']} on {cd.get('corrected_at', 'N/A')}.{cascade_line}"
+        )
+        pdf.multi_cell(0, 7, _safe(notice), border=1, fill=True,
+                        new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(4)
+
+    if metadata_correction_detail:
+        mcd = metadata_correction_detail
+        pdf.set_draw_color(*ACCENT)
+        # Amber for a flagged (retroactive-impact) correction -- "flag for
+        # human review" tone -- vs the routine correction's red, matching
+        # app.py's identical distinction.
+        pdf.set_fill_color(255, 245, 225) if mcd.get("retroactive_impact_flag") else pdf.set_fill_color(255, 228, 228)
+        pdf.set_font("Helvetica", "B", 10.5)
+        pdf.set_text_color(0, 0, 0)
+        notice = (
+            f"This is a formal correction to tender metadata. Field '{mcd['field']}' revised from "
+            f"'{_format_metadata_value(mcd['field'], mcd['original_value'])}' to "
+            f"'{_format_metadata_value(mcd['field'], mcd['corrected_value'])}'. Reason: {mcd['reason']}. "
+            f"Approved by {mcd['corrected_by']} on {mcd.get('corrected_at', 'N/A')}."
+        )
+        if mcd.get("retroactive_impact_flag"):
+            notice += f" FLAGGED FOR HUMAN REVIEW: {mcd.get('retroactive_impact_note', '')}"
+        pdf.multi_cell(0, 7, _safe(notice), border=1, fill=True,
+                        new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(4)
+
+    if archive_detail:
+        ad = archive_detail
+        pdf.set_draw_color(*ACCENT)
+        pdf.set_fill_color(255, 228, 228) if ad.get("just_archived") else pdf.set_fill_color(240, 242, 247)
+        pdf.set_font("Helvetica", "B", 10.5)
+        pdf.set_text_color(0, 0, 0)
+        notice = (
+            f"This tender is ARCHIVED. Reason: {ad.get('reason', 'N/A')}. Archived by "
+            f"{ad.get('archived_by', 'N/A')} on {ad.get('archived_at', 'N/A')}. It is hidden from the "
+            "active working list; its full history remains fully retrievable."
         )
         pdf.multi_cell(0, 7, _safe(notice), border=1, fill=True,
                         new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -306,6 +372,27 @@ def build_audit_pdf(
                       new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         section_num += 1
 
+    # ── Full escalation history (only the Archived / Closed Contracts browse
+    # view passes this -- the COMPLETE history, every year, not just the
+    # latest, so the PDF isn't missing anything the screen shows) ─────────
+    if full_escalation_history:
+        _section_title(pdf, f"{section_num}. Full Escalation History")
+        for e in full_escalation_history:
+            pdf.set_font("Helvetica", "B", 9.5)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(0, 6, _safe(f"{e['new_anchor_month']} -- {e['formula_type']}"),
+                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("Helvetica", "", 8.5)
+            pdf.set_text_color(70, 70, 70)
+            pdf.multi_cell(0, 5, _safe(
+                f"Prior: CPI {e['prior_anchor_cpi']}, R{e['prior_adjusted_price']:,.2f}  ->  "
+                f"New: CPI {e['new_anchor_cpi']}, R{e['new_adjusted_price']:,.2f}  |  "
+                f"Approved by {e['approved_by']} on {e['escalated_at']}"
+            ), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(1)
+        section_num += 1
+
     # ── Correction history (whenever this tender has ever been corrected,
     # on EVERY document generated for it -- never just the final number
     # with no trace of what changed) ──────────────────────────────────────
@@ -321,6 +408,15 @@ def build_audit_pdf(
                           f"Corrected: R{c['corrected_figure']:,.2f}  |  "
                           f"Reason: {c['reason']}  |  "
                           f"Approved by: {c['corrected_by']} on {c['corrected_at']}")
+            elif c["type"] == "METADATA_CORRECTION":
+                flag_tag = " [FLAGGED FOR REVIEW]" if c.get("retroactive_impact_flag") else ""
+                header = f"Metadata -- {c['field']}{flag_tag}"
+                detail = (f"Original: {_format_metadata_value(c['field'], c['original_value'])}  ->  "
+                          f"Corrected: {_format_metadata_value(c['field'], c['corrected_value'])}  |  "
+                          f"Reason: {c['reason']}  |  "
+                          f"Approved by: {c['corrected_by']} on {c['corrected_at']}")
+                if c.get("retroactive_impact_note"):
+                    detail += f"  |  {c['retroactive_impact_note']}"
             else:  # STALE_INPUT_FLAG
                 header = f"{c['year_month']} -- Stale Input Flag"
                 detail = c["note"]
