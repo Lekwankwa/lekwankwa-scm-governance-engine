@@ -92,14 +92,41 @@ def _section_title(pdf: FPDF, text: str):
 
 
 def _kv_table(pdf: FPDF, rows: list[tuple[str, str]], label_width: float = 75):
-    pdf.set_font("Helvetica", "", 10)
+    """Two-column label/value layout where BOTH columns independently wrap
+    within their own width and are structurally incapable of overlapping.
+
+    Fixes a real bug: the previous version drew the label with cell(), which
+    does NOT wrap or clip -- a label longer than label_width just overflows
+    past the column boundary, while the cursor still only advances by
+    exactly label_width (not by how far the overflow text actually
+    reached). The value then started printing at that fixed offset,
+    landing on top of the label's overflow (e.g. "Original Baseline (fixed
+    against escalation rollups)" colliding with its own value). Using
+    multi_cell for the label bounds it exactly the same way multi_cell
+    already (correctly) bounds the value -- so no label/value pair through
+    this function can ever collide again, regardless of label or value
+    length, not just the one that happened to overflow first.
+
+    Each column is positioned independently via set_xy() at a fixed x, and
+    the row advances to whichever column needed more wrapped lines.
+    """
+    left_x = pdf.l_margin
+    value_x = left_x + label_width
+    value_width = pdf.w - pdf.r_margin - value_x
     for label, value in rows:
+        row_y = pdf.get_y()
+
+        pdf.set_xy(left_x, row_y)
         pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(label_width, 7, _safe(label), border=0, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.multi_cell(label_width, 7, _safe(label), new_x=XPos.LEFT, new_y=YPos.NEXT)
+        label_bottom = pdf.get_y()
+
+        pdf.set_xy(value_x, row_y)
         pdf.set_font("Helvetica", "", 10)
-        # new_x=LMARGIN/new_y=NEXT: multi_cell otherwise leaves x at the right
-        # edge after wrapping, which would break the next row's layout.
-        pdf.multi_cell(0, 7, _safe(value), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.multi_cell(value_width, 7, _safe(value), new_x=XPos.LEFT, new_y=YPos.NEXT)
+        value_bottom = pdf.get_y()
+
+        pdf.set_xy(left_x, max(label_bottom, value_bottom))
 
 
 def _format_metadata_value(field: str, value) -> str:
@@ -231,7 +258,7 @@ def build_audit_pdf(
             "This Year's New Adjusted Price",
             f"{escalation_info['effective_date']} -- R{escalation_info['new_base_zar']:,.2f}",
         ))
-        _kv_table(pdf, derivation_rows, label_width=65)
+        _kv_table(pdf, derivation_rows, label_width=85)
         pdf.ln(2)
 
     if correction_detail:

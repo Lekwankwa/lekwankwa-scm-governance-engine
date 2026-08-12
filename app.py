@@ -403,7 +403,9 @@ def render_metadata_edit_or_correct_block(tender: dict, key_prefix: str) -> dict
         "trigger_preview_correction": False, "preview_data": None,
     }
     effective = resolve_effective_tender(tender)
-    is_annual = tender["baseline_type"] == "Total Annual Contract Allocation Value"
+    # cpa_formula_type is independent of baseline_type -- always editable/
+    # correctable here, regardless of Monthly vs Annual (see Fix 2's
+    # rationale at the anchor form above).
     formula_labels = {
         "CUMULATIVE_FROM_ORIGINAL": "Cumulative from Original Anchor",
         "COMPOUND_FROM_PRIOR_YEAR": "Compound from Prior Year",
@@ -424,15 +426,12 @@ def render_metadata_edit_or_correct_block(tender: dict, key_prefix: str) -> dict
             new_base = st.number_input("Base Contract Valuation (ZAR)", min_value=1.0,
                                          value=float(effective["original_base_value"]), step=1000.0,
                                          key=f"{key_prefix}_meta_base")
-            if is_annual:
-                current_formula = effective.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL")
-                new_formula = st.radio(
-                    "Annual CPA Formula Type", ["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"],
-                    index=["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"].index(current_formula),
-                    format_func=lambda x: formula_labels[x], key=f"{key_prefix}_meta_formula",
-                )
-            else:
-                new_formula = "CUMULATIVE_FROM_ORIGINAL"
+            current_formula = effective.get("cpa_formula_type", "CUMULATIVE_FROM_ORIGINAL")
+            new_formula = st.radio(
+                "CPA Formula Type", ["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"],
+                index=["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"].index(current_formula),
+                format_func=lambda x: formula_labels[x], key=f"{key_prefix}_meta_formula",
+            )
 
             if new_start >= new_end:
                 st.error("Contract End Date must be strictly after the Start Date.")
@@ -447,11 +446,11 @@ def render_metadata_edit_or_correct_block(tender: dict, key_prefix: str) -> dict
             st.caption("This tender has check/escalation/correction history -- metadata can no "
                         "longer be edited directly. This layers a new, separately dated "
                         "correction on top, same pattern already used for CPI figures.")
-            correctable_fields = [f for f in METADATA_CORRECTABLE_FIELDS if f != "cpa_formula_type" or is_annual]
+            correctable_fields = list(METADATA_CORRECTABLE_FIELDS)
             field_labels = {
                 "tender_name": "Tender / Project Name", "start_date": "Contract Start Date",
                 "end_date": "Contract End Date", "original_base_value": "Base Contract Valuation (ZAR)",
-                "cpa_formula_type": "Annual CPA Formula Type",
+                "cpa_formula_type": "CPA Formula Type",
             }
             field = st.selectbox("Field to Correct", correctable_fields,
                                    format_func=lambda f: field_labels[f], key=f"{key_prefix}_meta_field")
@@ -531,21 +530,20 @@ with st.sidebar:
             ["Monthly Base Recurring Invoice Value", "Total Annual Contract Allocation Value"],
         )
 
-        # Only meaningful for Annual-baseline tenders (it governs how Annual
-        # Escalation derives each year's adjusted price -- see the Calculate
-        # Annual Escalation branch below); fixed for Monthly tenders since
-        # they never go through that flow.
-        if baseline_type == "Total Annual Contract Allocation Value":
-            cpa_formula_type = st.radio(
-                "Annual CPA Formula Type (set once, permanent for this tender)",
-                ["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"],
-                format_func=lambda x: {
-                    "CUMULATIVE_FROM_ORIGINAL": "Cumulative from Original Anchor",
-                    "COMPOUND_FROM_PRIOR_YEAR": "Compound from Prior Year",
-                }[x],
-            )
-        else:
-            cpa_formula_type = "CUMULATIVE_FROM_ORIGINAL"
+        # baseline_type (how the Rand figure is structured) and
+        # cpa_formula_type (how escalation compounds over multiple years)
+        # are independent fields -- ANY tender, regardless of baseline_type,
+        # can run multiple years and reach an annual anniversary, so this is
+        # always required, never conditional on which baseline_type was
+        # chosen.
+        cpa_formula_type = st.radio(
+            "CPA Formula Type (set once, permanent for this tender)",
+            ["CUMULATIVE_FROM_ORIGINAL", "COMPOUND_FROM_PRIOR_YEAR"],
+            format_func=lambda x: {
+                "CUMULATIVE_FROM_ORIGINAL": "Cumulative from Original Anchor",
+                "COMPOUND_FROM_PRIOR_YEAR": "Compound from Prior Year",
+            }[x],
+        )
 
         base_value = st.number_input("Base Contract Valuation (ZAR)", min_value=1.0, value=1000000.0, step=1000.0)
 
@@ -574,8 +572,7 @@ with st.sidebar:
             effective_tender = resolve_effective_tender(selected_tender)
 
             st.caption(f"Baseline: {selected_tender['baseline_type']}")
-            if selected_tender["baseline_type"] == "Total Annual Contract Allocation Value":
-                st.caption(f"CPA Formula: {effective_tender.get('cpa_formula_type', 'CUMULATIVE_FROM_ORIGINAL')}")
+            st.caption(f"CPA Formula: {effective_tender.get('cpa_formula_type', 'CUMULATIVE_FROM_ORIGINAL')}")
             st.caption(f"Original Anchor (fixed against escalation rollups): {selected_tender['original_anchor_month']} "
                         f"@ CPI {selected_tender['original_anchor_cpi']} "
                         f"(base R{effective_tender['original_base_value']:,.2f})")
@@ -583,21 +580,21 @@ with st.sidebar:
                         f"@ CPI {selected_tender['current_anchor_cpi']} "
                         f"(adjusted price R{selected_tender['current_adjusted_price']:,.2f})")
 
-            # Every month on/after the CURRENT anchor is selectable for BOTH
-            # baseline types -- an annual tender isn't limited to its
-            # anniversary date, that's just the one that gets
-            # highlighted/defaulted to, and the only one "Calculate Annual
-            # Escalation" is offered for (see below).
+            # Every month on/after the CURRENT anchor is selectable, for BOTH
+            # baseline types identically -- baseline_type only describes how
+            # the Rand figure is structured, not whether a contract can
+            # reach an annual anniversary. Any tender is eligible for
+            # "Calculate Annual Escalation" on a true anniversary month (see
+            # below), regardless of Monthly vs Annual.
             archive_dates = pd.read_csv(ARCHIVE_PATH)["Date"].astype(str).tolist()
             eligible_months = [d for d in archive_dates if d >= selected_tender["current_anchor_month"]]
             anniversary_months = set(_anniversary_months(selected_tender["current_anchor_month"], eligible_months))
-            is_annual = selected_tender["baseline_type"] == "Total Annual Contract Allocation Value"
 
             if not eligible_months:
                 st.info("No eligible check month yet for this tender.")
             else:
                 default_index = len(eligible_months) - 1
-                if is_annual and anniversary_months:
+                if anniversary_months:
                     latest_anniversary = max(anniversary_months)
                     default_index = eligible_months.index(latest_anniversary)
 
@@ -608,7 +605,7 @@ with st.sidebar:
                 check_month_is_anniversary = check_month in anniversary_months
                 st.markdown("---")
 
-                if is_annual and check_month_is_anniversary:
+                if check_month_is_anniversary:
                     trigger_check = st.button("Run Monthly Check (preview, no registry change)")
                     trigger_calculate_escalation = st.button("Calculate Annual Escalation (proposal only)")
                 else:
