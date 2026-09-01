@@ -5,3 +5,7 @@ venv/
 data/scm_run_changelog.jsonl
 data/tenders.json
 *.log
+
+# Municipal SCM Audit Chatbot -- demo invoices are generated on first run by
+# run_demo.py / samples/generate_sample_invoice.py, not committed.
+samples/*.pdf

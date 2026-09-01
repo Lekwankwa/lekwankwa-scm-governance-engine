@@ -14,6 +14,13 @@ from core.tender_registry import (
 )
 from utils.document_gen import build_audit_pdf
 
+# Municipal SCM Audit Chatbot -- standalone feature (see CHATBOT_README.md).
+# Imported here only to power the "SCM Audit Chatbot" sidebar mode below;
+# nothing in the Tender Registry flow above depends on it. The dashboard mode
+# shows only the deterministic scm_parser.py verification result (no Ollama
+# LLM report step) -- see run_demo.py / ollama_bot.py for that, in the terminal.
+import scm_parser
+
 ARCHIVE_PATH = "data/stats_sa_cpi_archive.csv"
 
 # Set up clean, institutional dark theme dashboard configuration
@@ -489,10 +496,11 @@ def render_metadata_edit_or_correct_block(tender: dict, key_prefix: str) -> dict
 
 # TENDER REGISTRY (Sidebar UI)
 with st.sidebar:
-    st.header("Tender Registry")
+    st.header("Navigation")
     registry_mode = st.radio("Mode", [
         "Anchor New Tender", "Open Existing Tender",
         "Correct Prior Escalation", "Archived / Closed Contracts",
+        "SCM Audit Chatbot (Beta)",
     ])
     st.markdown("---")
 
@@ -504,6 +512,8 @@ with st.sidebar:
     trigger_direct_metadata_edit = False
     trigger_preview_metadata_correction = False
     trigger_view_archived = False
+    trigger_chatbot_analysis = False
+    chatbot_uploaded_file = None
     selected_tender = None
     check_month = None
     check_month_is_anniversary = False
@@ -691,7 +701,7 @@ with st.sidebar:
             st.markdown("---")
             trigger_preview_correction = st.button("Preview Correction")
 
-    else:  # registry_mode == "Archived / Closed Contracts"
+    elif registry_mode == "Archived / Closed Contracts":
         st.header("Archived / Closed Contracts")
         st.write("Nothing about an archived tender is ever hidden or deleted -- its full anchor, "
                   "escalation, and correction history remains fully retrievable here.")
@@ -721,6 +731,23 @@ with st.sidebar:
             # e.g. "Run Monthly Check") requiring an explicit click before
             # anything renders into the main frame -- no auto-render on select.
             trigger_view_archived = st.button("View Full History")
+
+    else:  # registry_mode == "SCM Audit Chatbot (Beta)"
+        # Standalone feature -- independent of the Tender Registry above.
+        # Reuses scm_parser.py's PDF parser + fallback verification engine
+        # and ollama_bot.py's local-LLM client, the same modules
+        # run_demo.py uses from the terminal. See CHATBOT_README.md.
+        st.header("Municipal SCM Audit Chatbot")
+        st.write(
+            "Upload a contractor invoice PDF to verify its claimed price escalation against the "
+            "Month M-1 Stats SA CPI/PPI rule. This is a standalone mock verification engine -- it "
+            "does not read or write the Tender Registry above."
+        )
+
+        chatbot_uploaded_file = st.file_uploader("Contractor Invoice (PDF)", type=["pdf"], key="chatbot_uploader")
+
+        st.markdown("---")
+        trigger_chatbot_analysis = st.button("Analyze Invoice")
 
 # MAIN FRAME PROCESSING GRAPHICS
 if trigger_anchor:
@@ -1370,3 +1397,203 @@ if "last_result" in st.session_state:
         archive_detail=res.get("archive_detail"),
         full_escalation_history=res.get("full_escalation_history"),
     )
+
+
+def _crosscheck_against_registry(fields: dict, outcome: dict) -> dict:
+    """The chatbot's own verification (scm_parser.verify_invoice()) never
+    reads data/tenders.json -- it trusts whatever baseline date / value the
+    invoice PDF itself claims, with no way to notice if that disagrees with
+    the tender's actual audited anchor. This is a SEPARATE, additive check:
+    if the invoice's Contract Reference Number happens to match an existing
+    tender_id in the registry, compare the invoice's claimed baseline month
+    and (if present) original contract value against that tender's
+    registry-anchored figures, and surface any mismatch explicitly rather
+    than silently trusting the invoice. Read-only -- never writes anything.
+    """
+    contract_id = outcome.get("contract_id")
+    if not contract_id:
+        return {"checked": False, "reason": "No Contract Reference Number was extracted from the invoice."}
+
+    tender = get_tender(contract_id)
+    if tender is None:
+        return {
+            "checked": True, "found": False,
+            "detail": f"No tender with ID '{contract_id}' exists in the registry -- this invoice's "
+                      "figures could not be cross-checked against an anchored record.",
+        }
+
+    effective = resolve_effective_tender(tender)
+    mismatches = []
+
+    invoice_baseline_month = (fields.get("baseline_date") or "")[:7]
+    registry_anchor_month = effective.get("original_anchor_month")
+    if invoice_baseline_month and registry_anchor_month and invoice_baseline_month != registry_anchor_month:
+        mismatches.append(
+            f"Invoice's Baseline Contract Date ({invoice_baseline_month}) does not match this "
+            f"tender's audited anchor month in the registry ({registry_anchor_month})."
+        )
+
+    invoice_value = fields.get("original_value")
+    registry_value = effective.get("original_base_value")
+    if invoice_value is not None and registry_value is not None and abs(float(invoice_value) - float(registry_value)) > 0.01:
+        mismatches.append(
+            f"Invoice's Original Contract Value (R{invoice_value:,.2f}) does not match this "
+            f"tender's registered original base value (R{registry_value:,.2f})."
+        )
+
+    return {
+        "checked": True, "found": True,
+        "tender_id": tender["tender_id"], "tender_name": effective.get("tender_name"),
+        "status": tender.get("status", "ACTIVE"),
+        "registry_anchor_month": registry_anchor_month, "registry_original_base_value": registry_value,
+        "mismatches": mismatches,
+    }
+
+
+# MUNICIPAL SCM AUDIT CHATBOT -- category reference browser. Shown whenever
+# this mode is selected, not gated behind "Analyze Invoice" -- lets you see
+# (not pick from -- verification always reads the category from the
+# uploaded invoice's own text) the full set of categories scm_parser.py
+# recognizes, sourced from the tenderbulletins.co.za taxonomy.
+if registry_mode == "SCM Audit Chatbot (Beta)":
+    st.markdown("---")
+    with st.expander(
+        f"Browse recognized categories ({len(scm_parser.CATEGORY_INDEX_MAP)} priced, "
+        f"{len(scm_parser.PENDING_CATEGORIES)} pending, "
+        f"{len(scm_parser.EXCLUDED_CATEGORIES)} excluded)"
+    ):
+        st.caption(
+            "Reference only -- verification always reads the category from the uploaded "
+            "invoice's own text; there's nothing to select here. Scope: Lekwankwa "
+            "Corporation Municipal Procurement Category Mapping (tenderbulletins.co.za)."
+        )
+        priced_rows = [
+            {"Category": name, "Index Type": info["index_type"], "Series": info["label"]}
+            for name, info in scm_parser.CATEGORY_INDEX_MAP.items()
+        ]
+        pending_rows = [
+            {"Category": name, "Index Type": "PENDING", "Series": "Not yet enabled -- see message on analysis"}
+            for name in scm_parser.PENDING_CATEGORIES
+        ]
+        excluded_rows = [
+            {"Category": name, "Index Type": "EXCLUDED", "Series": "Manual review required (JBCC/GCC/FIDIC/NEC)"}
+            for name in scm_parser.EXCLUDED_CATEGORIES
+        ]
+        category_df = (
+            pd.DataFrame(priced_rows + pending_rows + excluded_rows)
+            .sort_values("Category")
+            .reset_index(drop=True)
+        )
+        st.dataframe(category_df, use_container_width=True, height=400)
+
+# MUNICIPAL SCM AUDIT CHATBOT -- Result rendering
+# Deliberately separate from render_result_block()/"last_result" above: this
+# feature is standalone (see scm_parser.py / CHATBOT_README.md) and its
+# result shape (a scm_parser.verify_invoice() outcome dict) has nothing to
+# do with the Tender Registry's timeline/escalation/correction schema. The
+# cross-check below is the one deliberate, read-only exception: it queries
+# (never writes) the registry to catch an invoice whose claimed baseline/
+# value disagrees with what was actually anchored.
+if trigger_chatbot_analysis:
+    st.markdown("---")
+    st.header("Municipal SCM Audit Chatbot -- Result")
+
+    invoice_text = None
+    try:
+        if chatbot_uploaded_file is not None:
+            invoice_text = scm_parser.extract_text_from_pdf(chatbot_uploaded_file)
+        else:
+            st.error("Upload a PDF invoice before analyzing.")
+    except (FileNotFoundError, RuntimeError) as exc:
+        st.error(f"Could not read the invoice PDF: {exc}")
+
+    if invoice_text is not None:
+        fields = scm_parser.parse_invoice_fields(invoice_text)
+        outcome = scm_parser.verify_invoice(fields)
+
+        if fields["parse_warnings"]:
+            st.warning("Parse warnings:\n\n" + "\n".join(f"- {w}" for w in fields["parse_warnings"]))
+
+        status = outcome["status"]
+        if status == "PASSED":
+            st.success("VERIFICATION STATUS: [PASSED - COMPLIANT]")
+        elif status == "FAILED":
+            st.error("VERIFICATION STATUS: [FAILED - HARD-LOCK APPLIED]")
+        elif status == "MANUAL_REVIEW_REQUIRED":
+            st.warning(outcome["message"])
+        elif status == "CATEGORY_PENDING":
+            st.info(outcome["message"])
+        else:  # PARSE_ERROR / UNMAPPED_CATEGORY / INSUFFICIENT_DATA
+            st.warning(f"{status}: {outcome['detail']}")
+
+        if status in ("PASSED", "FAILED"):
+            # Category names can be long (e.g. "Security Services and
+            # Equipment") -- st.metric() truncates with an ellipsis in a
+            # narrow column, so it gets its own full-width line instead of
+            # sharing the 2-column metric row below.
+            col1, col2 = st.columns(2)
+            col1.metric("Contract Ref", outcome["contract_id"])
+            col2.metric("Index Type", outcome["index_type"] + (" [MOCK]" if outcome["index_type"] == "PPI" else ""))
+
+            category_line = f"**Category:** {outcome['category']}"
+            if outcome.get("category_raw") and outcome["category_raw"] != outcome["category"]:
+                category_line += f"  \n*(matched from invoice text: '{outcome['category_raw']}')*"
+            st.write(category_line)
+
+            st.write(
+                f"**Baseline Period:** {outcome['baseline_period']}  |  "
+                f"**Evaluated Period (M-1):** {outcome['evaluated_period']}  |  "
+                f"**Index Series:** {outcome['index_series_label']}"
+            )
+
+            breakdown_rows = [{
+                "Attribute": "Escalation Rate",
+                "Contractor Claimed": f"{outcome['claimed_escalation_pct']}%",
+                "System Limit (Stats SA)": f"{outcome['allowable_escalation_pct']}%",
+                "Status": outcome["escalation_rate_status"],
+            }]
+            if outcome["financial_impact_status"] == "N/A - NO BASE VALUE PROVIDED":
+                breakdown_rows.append({
+                    "Attribute": "Financial Impact", "Contractor Claimed": "N/A",
+                    "System Limit (Stats SA)": "N/A", "Status": outcome["financial_impact_status"],
+                })
+            else:
+                breakdown_rows.append({
+                    "Attribute": "Financial Impact",
+                    "Contractor Claimed": f"R{outcome['claimed_amount']:,.2f}",
+                    "System Limit (Stats SA)": f"R{outcome['allowable_amount']:,.2f}",
+                    "Status": outcome["financial_impact_status"],
+                })
+            st.table(pd.DataFrame(breakdown_rows).set_index("Attribute"))
+
+            if outcome["audit_hash"]:
+                st.caption(f"Cryptographic Audit Hash: SHA256:{outcome['audit_hash']}")
+
+        with st.expander("Raw backend verification result (JSON)"):
+            st.json(outcome)
+
+        st.markdown("---")
+        st.subheader("Registry Cross-Check")
+        st.caption(
+            "The verification above never reads data/tenders.json -- it trusts whatever this "
+            "invoice itself claims. This separate, read-only check compares those claims against "
+            "the audited Tender Registry, if a matching tender exists."
+        )
+        crosscheck = _crosscheck_against_registry(fields, outcome)
+        if not crosscheck["checked"]:
+            st.info(crosscheck["reason"])
+        elif not crosscheck["found"]:
+            st.warning(crosscheck["detail"])
+        elif crosscheck["mismatches"]:
+            st.error(
+                f"MISMATCH vs. registry record for '{crosscheck['tender_id']}' "
+                f"({crosscheck['tender_name']}, status: {crosscheck['status']}):\n\n"
+                + "\n".join(f"- {m}" for m in crosscheck["mismatches"])
+            )
+        else:
+            st.success(
+                f"Matches the audited registry record for '{crosscheck['tender_id']}' "
+                f"({crosscheck['tender_name']}, status: {crosscheck['status']}) -- anchor month "
+                f"{crosscheck['registry_anchor_month']}, original base value "
+                f"R{crosscheck['registry_original_base_value']:,.2f}."
+            )
