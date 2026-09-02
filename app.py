@@ -998,9 +998,10 @@ if "pending_escalation" in st.session_state:
     st.markdown("---")
     st.warning("\n\n".join(lines))
 
-    approver_name = st.text_input(
-        "Approver Name / Role (required to apply)", key="approver_input",
-        placeholder="e.g. J. Naidoo, SCM Manager",
+    approver_name = _current_approver_display()
+    st.text_input(
+        "Approver (auto-filled from your logged-in account)",
+        value=approver_name, disabled=True, key="approver_input_display",
     )
     confirm_col, discard_col = st.columns(2)
     with confirm_col:
