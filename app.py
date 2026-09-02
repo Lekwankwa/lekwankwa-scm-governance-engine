@@ -21,14 +21,48 @@ from utils.document_gen import build_audit_pdf
 # LLM report step) -- see run_demo.py / ollama_bot.py for that, in the terminal.
 import scm_parser
 
+# Municipal SCM Authentication Module -- provides login/signup and role-based access control
+from auth_module import render_auth_interface
+
+# Tender History Export Module -- generates combined audit trail PDFs and JSONs
+from utils.tender_history_export import download_tender_history
+
 ARCHIVE_PATH = "data/stats_sa_cpi_archive.csv"
 
 # Set up clean, institutional dark theme dashboard configuration
 st.set_page_config(page_title="Lekwankwa SCM Engine", layout="wide")
 
+# ============================================================================
+# AUTHENTICATION GATE
+# ============================================================================
+# Check authentication state first. If user is not logged in, show auth interface
+# and exit (don't render the main app). If authenticated, continue to main app.
+
+from auth_module import init_session_state
+init_session_state()
+
+if not st.session_state.authenticated:
+    # User is not authenticated - render login/signup interface
+    render_auth_interface()
+    st.stop()  # Stop execution; don't render main app
+
+# ============================================================================
+# MAIN APP (Only reached if user is authenticated)
+# ============================================================================
+
 st.title("Municipal SCM Governance Engine")
 st.subheader("Data-Driven Procurement Protection and Internal Audit Control Gateway")
 st.markdown("---")
+
+
+def _current_approver_display() -> str:
+    """'First Last (Role)' for the currently authenticated user (guaranteed
+    set -- the AUTHENTICATION GATE above already st.stop()s otherwise).
+    Used to auto-fill the Tender Registry's approval gates below instead of
+    asking someone who already logged in to retype their own name and role.
+    """
+    user = st.session_state.current_user
+    return f"{user['first_name']} {user['surname']} ({user['role']})"
 
 
 def _months_since_anchor(anchor_month: str, month: str) -> int:
@@ -643,6 +677,13 @@ with st.sidebar:
                     archive_target_tender = selected_tender
                     archive_reason = archive_reason_input
 
+            st.markdown("---")
+            st.subheader("📥 Export Complete Tender History")
+            st.write("Download the complete audit trail for this tender in one document, "
+                     "containing all events (anchor, checks, escalations, corrections) "
+                     "in strict chronological order.")
+            download_tender_history(selected_tender["tender_id"], selected_tender)
+
     elif registry_mode == "Correct Prior Escalation":
         st.header("Correct Prior Escalation")
         st.write("An approved annual price is never edited in place. This layers a new, "
@@ -730,7 +771,13 @@ with st.sidebar:
             # Consistent with every other action in this app (mutating or not,
             # e.g. "Run Monthly Check") requiring an explicit click before
             # anything renders into the main frame -- no auto-render on select.
-            trigger_view_archived = st.button("View Full History")
+            view_col, export_col = st.columns(2)
+            with view_col:
+                trigger_view_archived = st.button("View Full History")
+            with export_col:
+                if st.button("📥 Export Full History", key="archived_export_btn"):
+                    st.markdown("---")
+                    download_tender_history(archived_tender["tender_id"], archived_tender)
 
     else:  # registry_mode == "SCM Audit Chatbot (Beta)"
         # Standalone feature -- independent of the Tender Registry above.
@@ -1197,9 +1244,10 @@ if "pending_correction" in st.session_state:
     st.markdown("---")
     st.warning("\n\n".join(lines))
 
-    corrector_name = st.text_input(
-        "Approver Name / Role (required to apply)", key="corrector_input",
-        placeholder="e.g. J. Naidoo, SCM Manager",
+    corrector_name = _current_approver_display()
+    st.text_input(
+        "Approver (auto-filled from your logged-in account)",
+        value=corrector_name, disabled=True, key="corrector_input_display",
     )
     confirm_corr_col, discard_corr_col = st.columns(2)
     with confirm_corr_col:
@@ -1267,9 +1315,10 @@ if "pending_archive" in st.session_state:
         "This is ONE-DIRECTIONAL -- there is no 'Reactivate' action. The tender's full history "
         "is never deleted or altered; it only leaves the active 'Open Existing Tender' list."
     )
-    archived_by_name = st.text_input(
-        "Archived By (name / role, required to apply)", key="archived_by_input",
-        placeholder="e.g. T. Mokoena, SCM Clerk",
+    archived_by_name = _current_approver_display()
+    st.text_input(
+        "Archived By (auto-filled from your logged-in account)",
+        value=archived_by_name, disabled=True, key="archived_by_input_display",
     )
     confirm_arc_col, discard_arc_col = st.columns(2)
     with confirm_arc_col:
@@ -1329,9 +1378,10 @@ if "pending_metadata_correction" in st.session_state:
     else:
         st.warning("\n\n".join(lines))
 
-    metadata_corrector_name = st.text_input(
-        "Approver Name / Role (required to apply)", key="metadata_corrector_input",
-        placeholder="e.g. J. Naidoo, SCM Manager",
+    metadata_corrector_name = _current_approver_display()
+    st.text_input(
+        "Approver (auto-filled from your logged-in account)",
+        value=metadata_corrector_name, disabled=True, key="metadata_corrector_input_display",
     )
     confirm_meta_col, discard_meta_col = st.columns(2)
     with confirm_meta_col:

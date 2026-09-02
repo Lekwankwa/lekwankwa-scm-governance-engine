@@ -4,6 +4,7 @@ __pycache__/
 venv/
 data/scm_run_changelog.jsonl
 data/tenders.json
+data/scm_users.json
 *.log
 
 # Municipal SCM Audit Chatbot -- demo invoices are generated on first run by
